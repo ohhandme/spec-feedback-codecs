@@ -23,3 +23,5 @@
 ```
 
 完整交付包 SHA-256 为 `7b1a9870d413621b067e1a69f476f6788caf6dc9b769ed4b75a7d22dd09815ba`。
+
+正式 A100 权重复用、完整 3986 题补训和原 503 题验证的命令见 [formal/README.md](formal/README.md)。
