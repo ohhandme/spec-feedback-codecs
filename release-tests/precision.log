@@ -1,0 +1,1 @@
+precision passed {'pca_int8': 7, 'mlp_int8': 7, 'grouped_vq8': 7}

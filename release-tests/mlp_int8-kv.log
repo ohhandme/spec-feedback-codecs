@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "checks": [
+    "real TCP framing",
+    "tampered causal prefix rejected",
+    "actual tiny Qwen3 and configured message codec",
+    "Target greedy sequence matches independent AR",
+    "SHADOW and RAW proposals identical",
+    "cross-host round equality and paired summary"
+  ],
+  "scope": "CPU tiny models over local TCP; no 4090/A100 timing claim",
+  "artifacts": "C:\\Users\\asus\\.raft\\agents\\e30e5893-45b4-4644-ab42-81f6cc080698\\codec-local\\release-tests\\mlp_int8-kv"
+}

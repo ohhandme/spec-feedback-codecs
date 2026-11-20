@@ -1,0 +1,1 @@
+passed ['pca_int8', 'mlp_int8', 'grouped_vq8']

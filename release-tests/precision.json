@@ -1,0 +1,239 @@
+{
+  "pca_int8": [
+    {
+      "request": "[1, 9, 26]",
+      "fp32_bytes": "332928653025033f",
+      "bf16_bytes": "332928653025023f",
+      "identical_coordinates": 7,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.012160062789916992
+    },
+    {
+      "request": "[1, 9, 27]",
+      "fp32_bytes": "11b10184ea26fd3f",
+      "bf16_bytes": "10b10184ea26fc3e",
+      "identical_coordinates": 5,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.023938477039337158
+    },
+    {
+      "request": "[1, 9, 28]",
+      "fp32_bytes": "70de2be5d21e080e",
+      "bf16_bytes": "70de2be5d21e080e",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00870966911315918
+    },
+    {
+      "request": "[1, 9, 29]",
+      "fp32_bytes": "e8fc01379bcec53b",
+      "bf16_bytes": "e8fc01379bcec53b",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.007620573043823242
+    },
+    {
+      "request": "[1, 9, 30]",
+      "fp32_bytes": "ea583d390f1c6458",
+      "bf16_bytes": "ea583c390f1c6458",
+      "identical_coordinates": 7,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.016846776008605957
+    },
+    {
+      "request": "[1, 9, 32]",
+      "fp32_bytes": "1f3ac5012df2e612",
+      "bf16_bytes": "1f3ac5012df2e611",
+      "identical_coordinates": 7,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.011800408363342285
+    },
+    {
+      "request": "[1, 9, 33]",
+      "fp32_bytes": "1b10ffe407e67f0b",
+      "bf16_bytes": "1b0fffe307e57f0b",
+      "identical_coordinates": 5,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.022541582584381104
+    }
+  ],
+  "mlp_int8": [
+    {
+      "request": "[1, 9, 26]",
+      "fp32_bytes": "071511e7d8ee0107",
+      "bf16_bytes": "071511e7d8ee0107",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0016720294952392578
+    },
+    {
+      "request": "[1, 9, 27]",
+      "fp32_bytes": "f8da12151c00ece5",
+      "bf16_bytes": "f8da12151c00ece5",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0021806955337524414
+    },
+    {
+      "request": "[1, 9, 28]",
+      "fp32_bytes": "0c032ef7e9eafbfd",
+      "bf16_bytes": "0c042ff7e9eafbfd",
+      "identical_coordinates": 6,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.005109906196594238
+    },
+    {
+      "request": "[1, 9, 29]",
+      "fp32_bytes": "f0121ee5d8e3f0ef",
+      "bf16_bytes": "f0121ee5d8e3f0ef",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0010815858840942383
+    },
+    {
+      "request": "[1, 9, 30]",
+      "fp32_bytes": "e814fdf5e7ec0a11",
+      "bf16_bytes": "e814fdf5e7ec0a11",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0020303726196289062
+    },
+    {
+      "request": "[1, 9, 32]",
+      "fp32_bytes": "f9011a04daf10eef",
+      "bf16_bytes": "f9011a04daf10eef",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0017263293266296387
+    },
+    {
+      "request": "[1, 9, 33]",
+      "fp32_bytes": "f6f901f7d6f4fd01",
+      "bf16_bytes": "f6f901f7d6f4fd01",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0016733407974243164
+    }
+  ],
+  "grouped_vq8": [
+    {
+      "request": "[1, 9, 26]",
+      "fp32_bytes": "53a28f464821ffc7",
+      "bf16_bytes": "53a28f464821ffc7",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00011385977268218994
+    },
+    {
+      "request": "[1, 9, 27]",
+      "fp32_bytes": "da3bc2ead645db1b",
+      "bf16_bytes": "da3bc2ead645db1b",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00011917203664779663
+    },
+    {
+      "request": "[1, 9, 28]",
+      "fp32_bytes": "ac3fdfa1eb66f0ac",
+      "bf16_bytes": "ac3fdfa1eb66f0ac",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00011830031871795654
+    },
+    {
+      "request": "[1, 9, 29]",
+      "fp32_bytes": "96e49ec6f9d384a6",
+      "bf16_bytes": "96e49ec6f9d384a6",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.0001388266682624817
+    },
+    {
+      "request": "[1, 9, 30]",
+      "fp32_bytes": "e87fed23e9955b3a",
+      "bf16_bytes": "e87fed23e9955b3a",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00014538317918777466
+    },
+    {
+      "request": "[1, 9, 32]",
+      "fp32_bytes": "7bd79cdfcc21ead4",
+      "bf16_bytes": "7bd79cdfcc21ead4",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00011385977268218994
+    },
+    {
+      "request": "[1, 9, 33]",
+      "fp32_bytes": "2fe6c6f10c9504da",
+      "bf16_bytes": "2fe6c6f10c9504da",
+      "identical_coordinates": 8,
+      "wire_control_error_fp32_bf16": [
+        0.0,
+        0.0
+      ],
+      "max_cross_dtype_control_difference": 0.00012182444334030151
+    }
+  ]
+}

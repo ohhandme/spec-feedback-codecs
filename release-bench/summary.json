@@ -1,0 +1,577 @@
+{
+  "environment": {
+    "cpu": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+    "torch": "2.9.1+cpu",
+    "transformers": "4.57.3",
+    "threads": 1,
+    "dtype": "float32",
+    "gpu_event_us": null
+  },
+  "model_configs": [
+    {
+      "path": "C:\\Users\\asus\\Documents\\Codex\\2026-11-10\\w-x\\outputs\\A100-marker-handoff-20261114\\source_snapshot\\model_configs\\Qwen3-8B\\config.json",
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+      "hidden_size": 4096
+    },
+    {
+      "path": "C:\\Users\\asus\\Documents\\Codex\\2026-09-29\\n\\experiments\\specbranch-reproduction\\artifacts\\qwen3-0.6b-transfer\\config.json",
+      "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+      "hidden_size": 1024
+    }
+  ],
+  "warmup_per_method": 50,
+  "repeats_each_round": 500,
+  "rounds": 3,
+  "scope": "tiny Qwen3 CPU localhost; production widths use random inputs and codec only",
+  "stages_overlap": true,
+  "shapes": {
+    "tiny": {
+      "target_hidden": 32,
+      "draft_hidden": 32,
+      "input_dim": 97,
+      "codecs": {
+        "pca_int8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "pca_int8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 32,
+            "draft_hidden": 32,
+            "conditioned": true,
+            "rule": "centered-train-svd8-maxabs/127-eps1e-8",
+            "wire": "coord-order-i8-rne-symmetric",
+            "schema_sha256": "d11399f4c5238e2faf0a6624194e074e0ee0874ec2b94ae4d49ff2abacd77d6c",
+            "state_sha256": "5e054583bb4b2db6db371e2638a06b552c204eb6ac9188546f2a38d2a2dceef0"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 4769.2,
+          "first_encode_us": 1018.9,
+          "first_decode_us": 218.0,
+          "offline_fit_us": null,
+          "parameters": 1152,
+          "parameter_bytes": 4608,
+          "buffers_bytes": 3525,
+          "receiver_bytes": 4640,
+          "heldout_clipped_coordinate_fraction": 0.00575
+        },
+        "mlp_int8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "mlp_int8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 32,
+            "draft_hidden": 32,
+            "conditioned": true,
+            "rule": "linear128-silu-linear8-tanh-scale1/127",
+            "wire": "coord-order-i8-rne-symmetric",
+            "schema_sha256": "c35c76b7c4023444a3a210c782b30c536277db86d3c6737a1befcbecd71d69ed",
+            "state_sha256": "5c6607be41abf9a32c7797a70b3becff72b426c1000ffaa374b42fb256651c0f"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 1615.3,
+          "first_encode_us": 299.0,
+          "first_decode_us": 34.2,
+          "offline_fit_us": null,
+          "parameters": 14728,
+          "parameter_bytes": 58912,
+          "buffers_bytes": 32,
+          "receiver_bytes": 4640,
+          "heldout_clipped_coordinate_fraction": 0.0
+        },
+        "grouped_vq8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "grouped_vq8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 32,
+            "draft_hidden": 32,
+            "conditioned": true,
+            "rule": "argmax8x256-codebook16",
+            "wire": "group-order-u8",
+            "schema_sha256": "358dae8539b8aa851a4eedc108ad9ee37ee0198f62298aa8e9081f9da93cce66",
+            "state_sha256": "bac8f4a0faa6cb3f0d13c90e0276d132add81a92a13b2ee08b6e157b71ac3abb"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 8437.0,
+          "first_encode_us": 662.9,
+          "first_decode_us": 113.7,
+          "offline_fit_us": null,
+          "parameters": 309504,
+          "parameter_bytes": 1238016,
+          "buffers_bytes": 0,
+          "receiver_bytes": 131072,
+          "heldout_clipped_coordinate_fraction": null
+        }
+      },
+      "timings": {
+        "pca_int8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 143.9,
+            "mean_us": 162.7316,
+            "p95_us": 298.605
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 103.8,
+            "mean_us": 120.5042,
+            "p95_us": 220.83999999999997
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 55.0,
+            "mean_us": 63.45073333333333,
+            "p95_us": 114.705
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 276.65,
+            "mean_us": 319.06913333333335,
+            "p95_us": 609.1249999999999
+          },
+          "control_including_decode": {
+            "n": 1500,
+            "p50_us": 973.65,
+            "mean_us": 1019.9836666666666,
+            "p95_us": 1773.6399999999999
+          },
+          "repair_projection": {
+            "n": 1500,
+            "p50_us": 225.55,
+            "mean_us": 250.2854,
+            "p95_us": 458.6199999999999
+          }
+        },
+        "mlp_int8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 186.14999999999998,
+            "mean_us": 210.5452,
+            "p95_us": 387.53499999999985
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 102.5,
+            "mean_us": 119.71613333333333,
+            "p95_us": 221.73999999999995
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 53.0,
+            "mean_us": 61.909733333333335,
+            "p95_us": 115.02999999999997
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 316.1,
+            "mean_us": 363.7868,
+            "p95_us": 682.0649999999998
+          },
+          "control_including_decode": {
+            "n": 1500,
+            "p50_us": 958.3,
+            "mean_us": 1007.8782666666667,
+            "p95_us": 1746.76
+          },
+          "repair_projection": {
+            "n": 1500,
+            "p50_us": 214.55,
+            "mean_us": 249.27106666666666,
+            "p95_us": 454.43499999999995
+          }
+        },
+        "grouped_vq8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 282.35,
+            "mean_us": 309.7771333333333,
+            "p95_us": 557.205
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 35.8,
+            "mean_us": 41.876666666666665,
+            "p95_us": 75.905
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 54.05,
+            "mean_us": 65.98606666666667,
+            "p95_us": 119.10499999999999
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 349.45,
+            "mean_us": 393.5,
+            "p95_us": 728.72
+          },
+          "control_including_decode": {
+            "n": 1500,
+            "p50_us": 955.3,
+            "mean_us": 1011.8145333333333,
+            "p95_us": 1792.99
+          },
+          "repair_projection": {
+            "n": 1500,
+            "p50_us": 220.45,
+            "mean_us": 250.86246666666668,
+            "p95_us": 453.1
+          }
+        }
+      }
+    },
+    "production_shape": {
+      "target_hidden": 4096,
+      "draft_hidden": 1024,
+      "input_dim": 6145,
+      "codecs": {
+        "pca_int8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "pca_int8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 4096,
+            "draft_hidden": 1024,
+            "conditioned": true,
+            "rule": "centered-train-svd8-maxabs/127-eps1e-8",
+            "wire": "coord-order-i8-rne-symmetric",
+            "schema_sha256": "af393046d960319d23fd5f7babc1bd5cfe711a9c95f9f0625d2fca4bbbbdf713",
+            "state_sha256": "3e24b07c2bd5152d6b28fca311c477cf26ba09c22546f4b3e753ce304e8cdc59"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 294.5,
+          "first_encode_us": 490.2,
+          "first_decode_us": 83.5,
+          "offline_fit_us": 36892.5,
+          "parameters": 1152,
+          "parameter_bytes": 4608,
+          "buffers_bytes": 221253,
+          "receiver_bytes": 4640,
+          "heldout_clipped_coordinate_fraction": 0.0
+        },
+        "mlp_int8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "mlp_int8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 4096,
+            "draft_hidden": 1024,
+            "conditioned": true,
+            "rule": "linear128-silu-linear8-tanh-scale1/127",
+            "wire": "coord-order-i8-rne-symmetric",
+            "schema_sha256": "9b4283a663ec7081d1cb738f57faf7e8494da912edd544a2fdd244022b3990c1",
+            "state_sha256": "d9644b4864a87b2e75085a710bd8b1244ded0528d9e4f91487f4d36a94284cb9"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 5237.4,
+          "first_encode_us": 897.2,
+          "first_decode_us": 91.1,
+          "offline_fit_us": null,
+          "parameters": 788872,
+          "parameter_bytes": 3155488,
+          "buffers_bytes": 32,
+          "receiver_bytes": 4640,
+          "heldout_clipped_coordinate_fraction": 0.0
+        },
+        "grouped_vq8": {
+          "binding": {
+            "version": 1,
+            "codec_type": "grouped_vq8",
+            "bits": 64,
+            "control_dim": 128,
+            "target_hidden": 4096,
+            "draft_hidden": 1024,
+            "conditioned": true,
+            "rule": "argmax8x256-codebook16",
+            "wire": "group-order-u8",
+            "schema_sha256": "991d4f5d4aae0342840fa14a4e7d02ad2f9850e296dd863cf80d44cbf60d68f4",
+            "state_sha256": "78867da3a888db5743e1e110213ecc1acda267ee27a79847d93f4be89581c91c"
+          },
+          "payload_bytes": 8,
+          "construct_or_load_us": 7557.6,
+          "first_encode_us": 975.6,
+          "first_decode_us": 107.7,
+          "offline_fit_us": null,
+          "parameters": 1083648,
+          "parameter_bytes": 4334592,
+          "buffers_bytes": 0,
+          "receiver_bytes": 131072,
+          "heldout_clipped_coordinate_fraction": null
+        }
+      },
+      "timings": {
+        "pca_int8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 244.2,
+            "mean_us": 265.58346666666665,
+            "p95_us": 501.525
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 141.35000000000002,
+            "mean_us": 155.80973333333333,
+            "p95_us": 305.94499999999994
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 61.7,
+            "mean_us": 68.94733333333333,
+            "p95_us": 136.0
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 437.85,
+            "mean_us": 478.5056,
+            "p95_us": 899.0049999999998
+          }
+        },
+        "mlp_int8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 441.29999999999995,
+            "mean_us": 469.23226666666665,
+            "p95_us": 826.7949999999996
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 150.8,
+            "mean_us": 164.6462,
+            "p95_us": 331.32
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 61.1,
+            "mean_us": 66.8542,
+            "p95_us": 129.0
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 650.8,
+            "mean_us": 695.8038666666666,
+            "p95_us": 1137.355
+          }
+        },
+        "grouped_vq8": {
+          "encoder": {
+            "n": 1500,
+            "p50_us": 575.75,
+            "mean_us": 609.4251333333333,
+            "p95_us": 1019.765
+          },
+          "quantize_pack": {
+            "n": 1500,
+            "p50_us": 52.1,
+            "mean_us": 56.61686666666667,
+            "p95_us": 107.94499999999996
+          },
+          "decoder": {
+            "n": 1500,
+            "p50_us": 71.55,
+            "mean_us": 79.06686666666667,
+            "p95_us": 143.305
+          },
+          "complete_codec": {
+            "n": 1500,
+            "p50_us": 695.6500000000001,
+            "mean_us": 736.4789333333333,
+            "p95_us": 1269.7299999999996
+          }
+        }
+      }
+    }
+  },
+  "localhost_tcp": {
+    "pca_int8": {
+      "raw": {
+        "n": 9,
+        "p50_us": 421766.29999994475,
+        "mean_us": 474741.9444447587,
+        "p95_us": 586269.8199998704,
+        "samples_us": [
+          589655.4999999353,
+          415793.19999982545,
+          406289.2000001739,
+          573905.9999996243,
+          406645.0000009354,
+          400750.30000116385,
+          581191.299999773,
+          421766.29999994475,
+          476680.70000145235
+        ],
+        "framed_up_bytes": 14475,
+        "framed_down_bytes": 12202,
+        "feedback_bytes": 0
+      },
+      "shadow": {
+        "n": 9,
+        "p50_us": 441736.2000003777,
+        "mean_us": 512127.7000000393,
+        "p95_us": 693610.6199998903,
+        "samples_us": [
+          632828.6999996635,
+          441736.2000003777,
+          436254.70000006317,
+          659680.2000003663,
+          439902.59999918635,
+          403263.1999998557,
+          716230.899999573,
+          443687.10000162537,
+          435565.6999996427
+        ],
+        "framed_up_bytes": 14529,
+        "framed_down_bytes": 12828,
+        "feedback_bytes": 624
+      },
+      "active": {
+        "n": 9,
+        "p50_us": 466078.6000004009,
+        "mean_us": 553141.6555556158,
+        "p95_us": 786254.5800002408,
+        "samples_us": [
+          445410.0999992079,
+          438583.90000059444,
+          676298.4999986656,
+          446374.4000004226,
+          433407.1000012045,
+          798724.8999997973,
+          505848.299999343,
+          466078.6000004009,
+          767549.100000906
+        ],
+        "framed_up_bytes": 14538,
+        "framed_down_bytes": 12825,
+        "feedback_bytes": 624
+      }
+    },
+    "mlp_int8": {
+      "raw": {
+        "n": 9,
+        "p50_us": 499325.9000002581,
+        "mean_us": 559035.133333762,
+        "p95_us": 868222.5200005631,
+        "samples_us": [
+          659094.8000011849,
+          437296.10000082175,
+          490710.4000012623,
+          591929.0999991063,
+          371214.20000039507,
+          423541.19999981776,
+          1007641.0000001488,
+          550563.5000008624,
+          499325.9000002581
+        ],
+        "framed_up_bytes": 14475,
+        "framed_down_bytes": 12200,
+        "feedback_bytes": 0
+      },
+      "shadow": {
+        "n": 9,
+        "p50_us": 568150.0999999116,
+        "mean_us": 610738.2222223047,
+        "p95_us": 924225.3599997638,
+        "samples_us": [
+          608209.5999990997,
+          468909.50000124576,
+          568150.0999999116,
+          685366.1999994074,
+          499602.2000013909,
+          446903.7999988359,
+          1083464.8000000017,
+          554099.0000008605,
+          581938.799999989
+        ],
+        "framed_up_bytes": 14529,
+        "framed_down_bytes": 12822,
+        "feedback_bytes": 624
+      },
+      "active": {
+        "n": 9,
+        "p50_us": 554808.2000004797,
+        "mean_us": 591817.2444445292,
+        "p95_us": 798031.6000001039,
+        "samples_us": [
+          554663.3999983897,
+          585564.400000294,
+          554808.2000004797,
+          469514.700000218,
+          455233.39999999735,
+          701594.8000007484,
+          534605.4000001459,
+          608048.1000008149,
+          862322.7999996743
+        ],
+        "framed_up_bytes": 14529,
+        "framed_down_bytes": 12823,
+        "feedback_bytes": 624
+      }
+    },
+    "grouped_vq8": {
+      "raw": {
+        "n": 9,
+        "p50_us": 429600.89999905904,
+        "mean_us": 505173.4777775386,
+        "p95_us": 719843.7999999442,
+        "samples_us": [
+          567981.8000007799,
+          365535.4000002262,
+          392329.1999999492,
+          690403.9000000921,
+          415161.6999988619,
+          538069.7999989934,
+          739470.3999998455,
+          408008.20000004023,
+          429600.89999905904
+        ],
+        "framed_up_bytes": 14475,
+        "framed_down_bytes": 12199,
+        "feedback_bytes": 0
+      },
+      "shadow": {
+        "n": 9,
+        "p50_us": 428551.9999993994,
+        "mean_us": 526954.2888886968,
+        "p95_us": 728523.0400000727,
+        "samples_us": [
+          637047.7000000392,
+          428551.9999993994,
+          405628.099999376,
+          631074.4999991584,
+          426123.3999986871,
+          615308.2000000722,
+          789506.6000000952,
+          410425.60000096273,
+          398922.5000004808
+        ],
+        "framed_up_bytes": 14529,
+        "framed_down_bytes": 12829,
+        "feedback_bytes": 624
+      },
+      "active": {
+        "n": 9,
+        "p50_us": 509173.70000024675,
+        "mean_us": 545950.6444448278,
+        "p95_us": 675836.640000125,
+        "samples_us": [
+          398473.200000808,
+          400677.9000010283,
+          657142.0000000217,
+          509173.70000024675,
+          641363.700000511,
+          686389.3999998254,
+          469015.09999952395,
+          491313.3000009111,
+          660007.5000005745
+        ],
+        "framed_up_bytes": 14526,
+        "framed_down_bytes": 12830,
+        "feedback_bytes": 624
+      }
+    }
+  }
+}

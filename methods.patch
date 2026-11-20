@@ -1,0 +1,1529 @@
+--- a/demo/cpu_test.py
++++ b/demo/cpu_test.py
+@@ -5,19 +5,28 @@
+ from pathlib import Path
+ import socket
+ import tempfile
++from collections import Counter
++from hashlib import sha256
+ import torch
+ from transformers import Qwen3Config, Qwen3ForCausalLM
+ import latency_smoke as smoke
+ from feedback_codec.hf_backend import HFTargetBackend, HFDraftBackend, _FrozenHFBackend
+ from feedback_codec.codec import CodecConfig
+ from h_vq64_head import HTaskHead
++from message_codecs import METHODS, binding, restore_codec
+ 
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--implementation", choices=("reference", "boundary", "kv"), default="reference")
+     parser.add_argument("--out", type=Path, help="new directory for this run's receipts and rows")
++    parser.add_argument("--codec", choices=METHODS, default="grouped_vq8")
++    parser.add_argument("--checkpoint", type=Path)
++    parser.add_argument("--warmup-rounds", type=int, default=0)
++    parser.add_argument("--repeats", type=int, default=1)
+     args = parser.parse_args()
++    if args.warmup_rounds < 0 or args.repeats < 1:
++        parser.error("invalid TCP repetition count")
+     torch.set_num_threads(1)
+     torch.manual_seed(121)
+     config = Qwen3Config(vocab_size=41, hidden_size=32, intermediate_size=64,
+@@ -30,7 +39,16 @@
+         teacher_hidden = HFDraftBackend.teacher_hidden
+     draft = Draft(Qwen3ForCausalLM(config), object(), device="cpu")
+     head = HTaskHead(CodecConfig(32, 32, 41), draft.model.get_output_embeddings(),
+-                     draft_embedding=draft.model.get_input_embeddings()).eval()
++                     draft_embedding=draft.model.get_input_embeddings(), codec_type=args.codec).eval()
++    if args.checkpoint:
++        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
++        if checkpoint["binding"]["codec_type"] != args.codec:
++            raise ValueError("checkpoint method differs")
++        head.message = restore_codec(checkpoint["binding"], checkpoint["message"])
++        head.base.core.repair.U.weight.data.copy_(checkpoint["repair_U"])
++    elif args.codec != "grouped_vq8":
++        raise ValueError("new codecs require a fitted smoke checkpoint")
++    head.message.eval()
+     head.requires_grad_(False)
+     if args.implementation == "reference":
+         native = smoke.NativeDraft(draft, head)
+@@ -42,6 +60,12 @@
+         decoder_inputs.append(kwargs["input_ids"].shape[-1])
+     draft.model.model.register_forward_pre_hook(record_decoder_input, with_kwargs=True)
+     contract = {"window": 8, "max_new": 16, "eos_token_id": 40, "draft_implementation": args.implementation}
++    contract["codec_binding"] = binding(head.message)
++    contract["source_sha256"] = json.loads((Path(__file__).parent / "variant_config.json").read_text())["contract"]["source_sha256"]
++    contract["checkpoint_sha256"] = (sha256(args.checkpoint.read_bytes()).hexdigest()
++                                     if args.checkpoint else "legacy-tiny-seed121")
++    cloud_message = restore_codec(contract["codec_binding"], head.message.state_dict()).requires_grad_(False).eval()
++    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(head.message.parameters(), cloud_message.parameters()))
+     roster = {}
+     for i, prompt in enumerate(([1, 2], [1, 3, 4], [1, 6])):
+         output = []
+@@ -52,10 +76,25 @@
+                 break
+         roster[str(i)] = {"request_id": str(i), "prompt_token_ids": list(prompt),
+                            "expected_target_token_ids": output}
++    hooks = Counter()
++    wire_hex = []
++    def counted(owner, name):
++        original = getattr(owner, name)
++        def call(*args, **kwargs):
++            hooks[name] += 1
++            return original(*args, **kwargs)
++        setattr(owner, name, call)
++    for obj, method in [(head.message, "decode_payload"), (head.base.core.repair, "repair_from_control")]:
++        counted(obj, method)
++    if args.implementation != "reference":
++        counted(native, "build_control")
+     def encode(hidden, accepted, rejected, answer):
+         table = draft.model.get_input_embeddings().weight
+-        return head.message.encode_payload(hidden.reshape(1, -1), accepted,
++        hooks["encode_payload"] += 1
++        payload = cloud_message.encode_payload(hidden.reshape(1, -1), accepted,
+             None if rejected is None else table[rejected].reshape(1, -1), table[answer].reshape(1, -1))
++        wire_hex.append(payload.hex())
++        return payload
+     session = smoke.CloudSession(target, encode, roster, contract, "cpu")
+     session.begin({"arm": "raw", "request_id": "0", "trial_id": "bad", "warmup": True, "prompt_ids": [1, 2]})
+     try:
+@@ -83,7 +122,11 @@
+                 request, payload = wire.recv()
+                 assert not payload
+                 kind = request["type"]
+-                if kind == "start":reply, feedback = session.begin(request)
++                if kind == "hello":
++                    assert request["contract_id"] == smoke.digest(contract)
++                    assert binding(cloud_message) == contract["codec_binding"]
++                    reply, feedback = {"contract_id": smoke.digest(contract)}, b""
++                elif kind == "start":reply, feedback = session.begin(request)
+                 elif kind == "verify":reply, feedback = session.verify(request)
+                 elif kind == "finish_request":
+                     row = session.finish_request()
+@@ -96,27 +139,39 @@
+         future = pool.submit(serve)
+         with socket.create_connection(("127.0.0.1", port), timeout=10) as channel:
+             wire = smoke.Wire(channel)
+-            for row in roster.values():
+-                for arm in smoke.ARMS:
+-                    trial = f"repeat0-request{row['request_id']}-{arm}"
+-                    decoder_inputs.clear()
+-                    result = smoke.edge_request(wire, native, row, arm, trial, False, contract)
+-                    assert result["output_ids"] == row["expected_target_token_ids"]
+-                    if args.implementation != "reference":
+-                        counters = result["draft_cache_counters"]
+-                        assert counters["decoder_calls"] == len(decoder_inputs) == result["timing"]["calls"]["draft_decoder_forward"]
+-                        assert counters["decoder_input_tokens"] == sum(decoder_inputs)
+-                    else:
+-                        calls = result["timing"]["calls"]
+-                        assert len(decoder_inputs) == calls["draft_native_forward"] + calls.get("edge_feedback_prepare", 0)
+-                    result["observed_decoder_input_lengths"] = decoder_inputs.copy()
+-                    smoke.write(edge_root / "rows" / (smoke.digest(trial) + ".json"), result)
++            hello, _, _ = wire.rpc({"type": "hello", "contract_id": smoke.digest(contract)})
++            assert hello["contract_id"] == smoke.digest(contract)
++            for repeat in range(-args.warmup_rounds, args.repeats):
++                for row in roster.values():
++                    for arm in smoke.ARMS:
++                        trial = f"repeat{repeat}-request{row['request_id']}-{arm}"
++                        decoder_inputs.clear()
++                        hooks.clear()
++                        wire_hex.clear()
++                        result = smoke.edge_request(wire, native, row, arm, trial, repeat < 0, contract)
++                        assert result["output_ids"] == row["expected_target_token_ids"]
++                        if args.implementation != "reference":
++                            counters = result["draft_cache_counters"]
++                            assert counters["decoder_calls"] == len(decoder_inputs) == result["timing"]["calls"]["draft_decoder_forward"]
++                            assert counters["decoder_input_tokens"] == sum(decoder_inputs)
++                        else:
++                            calls = result["timing"]["calls"]
++                            assert len(decoder_inputs) == calls["draft_native_forward"] + calls.get("edge_feedback_prepare", 0)
++                        expected_feedback = (result["verification_rounds"] - 1) if arm != "raw" else 0
++                        assert hooks["encode_payload"] == expected_feedback
++                        if args.implementation != "reference":
++                            assert hooks["decode_payload"] == hooks["build_control"] == expected_feedback
++                            assert hooks["repair_from_control"] == counters.get("repair_projections", 0)
++                        result["observed_calls"] = dict(hooks)
++                        result["feedback_hex"] = wire_hex.copy()
++                        result["observed_decoder_input_lengths"] = decoder_inputs.copy()
++                        smoke.write(edge_root / "rows" / (smoke.digest(trial) + ".json"), result)
+             wire.rpc({"type": "shutdown"})
+         future.result(timeout=10)
+     listener.close()
+-    smoke.summarize(edge_root, cloud_root, root / "summary.json", expected_contract=contract, expected_trials=9)
++    smoke.summarize(edge_root, cloud_root, root / "summary.json", expected_contract=contract, expected_trials=9 * (args.warmup_rounds + args.repeats))
+     result = {"status": "pass", "checks": ["real TCP framing", "tampered causal prefix rejected",
+-        "actual tiny Qwen3 and unchanged codec/repair graph", "Target greedy sequence matches independent AR",
++        "actual tiny Qwen3 and configured message codec", "Target greedy sequence matches independent AR",
+         "SHADOW and RAW proposals identical", "cross-host round equality and paired summary"],
+         "scope": "CPU tiny models over local TCP; no 4090/A100 timing claim", "artifacts": str(root)}
+     smoke.write((root if args.out else Path(__file__).parent) / "cpu_receipt.json", result)
+--- a/demo/h_vq64_codec.py
++++ b/demo/h_vq64_codec.py
+@@ -16,23 +16,7 @@
+ EDGE_CONTROL_DIM = WIRE_BYTES * CODE_DIM
+ 
+ 
+-class ConditionedVQ64(nn.Module):
+-    def __init__(self, *, target_hidden_size: int, draft_hidden_size: int,
+-                 conditioned: bool = True) -> None:
+-        super().__init__()
+-        if target_hidden_size <= 0 or draft_hidden_size <= 0:
+-            raise ValueError("hidden sizes must be positive")
+-        self.target_hidden_size = target_hidden_size
+-        self.draft_hidden_size = draft_hidden_size
+-        self.conditioned = conditioned
+-        input_dim = target_hidden_size + 2 * draft_hidden_size + 1
+-        self.encoder = nn.Sequential(
+-            nn.Linear(input_dim, EDGE_CONTROL_DIM), nn.SiLU(),
+-            nn.Linear(EDGE_CONTROL_DIM, WIRE_BYTES * CHOICES),
+-        )
+-        self.codebook = nn.Parameter(
+-            torch.randn(WIRE_BYTES, CHOICES, CODE_DIM) * .02)
+-
++class CausalCodec(nn.Module):
+     def _inputs(self, target_hidden: Tensor, accepted_count: int,
+                 rejected_embedding: Tensor | None,
+                 correction_embedding: Tensor) -> Tensor:
+@@ -54,8 +38,9 @@
+             raise ValueError("rejected embedding has wrong shape or value")
+         if (rejected_embedding is None) != (accepted_count == WIRE_BYTES):
+             raise ValueError("full-accept bonus and rejected-token fields differ")
+-        device = self.codebook.device
+-        dtype = self.codebook.dtype
++        anchor = next(self.parameters())
++        device = anchor.device
++        dtype = anchor.dtype
+         target = target_hidden.detach().to(device=device, dtype=dtype)
+         if self.conditioned:
+             rejected = (torch.zeros(1, self.draft_hidden_size, device=device,
+@@ -72,6 +57,26 @@
+             correction = torch.zeros_like(rejected)
+             accepted = torch.zeros(1, 1, device=device, dtype=dtype)
+         return torch.cat((target, rejected, correction, accepted), dim=-1)
++
++
++class ConditionedVQ64(CausalCodec):
++    codec_type = 'grouped_vq8'
++
++    def __init__(self, *, target_hidden_size: int, draft_hidden_size: int,
++                 conditioned: bool = True) -> None:
++        super().__init__()
++        if target_hidden_size <= 0 or draft_hidden_size <= 0:
++            raise ValueError("hidden sizes must be positive")
++        self.target_hidden_size = target_hidden_size
++        self.draft_hidden_size = draft_hidden_size
++        self.conditioned = conditioned
++        input_dim = target_hidden_size + 2 * draft_hidden_size + 1
++        self.encoder = nn.Sequential(
++            nn.Linear(input_dim, EDGE_CONTROL_DIM), nn.SiLU(),
++            nn.Linear(EDGE_CONTROL_DIM, WIRE_BYTES * CHOICES),
++        )
++        self.codebook = nn.Parameter(
++            torch.randn(WIRE_BYTES, CHOICES, CODE_DIM) * .02)
+ 
+     def logits(self, target_hidden: Tensor, accepted_count: int,
+                rejected_embedding: Tensor | None,
+@@ -128,7 +133,7 @@
+                              rejected_embedding, correction_embedding)
+         soft = F.softmax(logits / temperature, dim=-1)
+         hard = F.one_hot(logits.argmax(-1), CHOICES).to(dtype=soft.dtype)
+-        straight_through = hard - soft.detach() + soft
++        straight_through = hard + (soft - soft.detach())
+         control = torch.einsum("gc,gcd->gd", straight_through,
+                                self.codebook).reshape(1, EDGE_CONTROL_DIM)
+         if not torch.isfinite(control).all():
+--- a/demo/h_vq64_head.py
++++ b/demo/h_vq64_head.py
+@@ -10,7 +10,8 @@
+ from feedback_codec.v10_four_arm import V10FourArmHead, V10PreparedState
+ from feedback_codec.fixed_probe import ProbeObservation
+ from causal_operands import causal_inputs
+-from h_vq64_codec import ConditionedVQ64, EDGE_CONTROL_DIM
++from h_vq64_codec import EDGE_CONTROL_DIM
++from message_codecs import make_codec
+ 
+ 
+ EOS = 151645
+@@ -27,7 +28,7 @@
+ 
+ class HTaskHead(nn.Module):
+     def __init__(self, config, output_head: nn.Module, *,
+-                 draft_embedding: nn.Module) -> None:
++                 draft_embedding: nn.Module, codec_type='grouped_vq8') -> None:
+         super().__init__()
+         if config.window != 8 or config.rank != 32 or config.groups != 8 \
+                 or config.choices != 256 or config.code_dim != 16:
+@@ -36,11 +37,8 @@
+         self.mode = MODE
+         self.base = V10FourArmHead(config, output_head, mode="C",
+                                    draft_embedding=draft_embedding)
+-        self.message = ConditionedVQ64(
+-            target_hidden_size=config.target_hidden_size,
+-            draft_hidden_size=config.draft_hidden_size,
+-            conditioned=True)
+-        if self.message.codebook.shape != (8, 256, 16):
++        self.message = make_codec(codec_type, config.target_hidden_size, config.draft_hidden_size)
++        if codec_type == "grouped_vq8" and self.message.codebook.shape != (8, 256, 16):
+             raise AssertionError("edge codebook capacity differs")
+ 
+     def prepare_observation(self, observation: ProbeObservation, draft) -> MessageState:
+@@ -117,13 +115,18 @@
+         return int(logits[0].argmax(-1).item())
+ 
+     def trainable_state_dict(self) -> dict[str, Tensor]:
+-        return {name: parameter.detach().cpu().clone()
++        out = {name: parameter.detach().cpu().clone()
+                 for name, parameter in self.named_parameters()
+                 if parameter.requires_grad}
++
++        out.update({"message." + name: value.detach().cpu().clone()
++                    for name, value in self.message.named_buffers()})
++        return out
+ 
+     def load_trainable_state_dict(self, state: dict[str, Tensor]) -> None:
+         params = {name: parameter for name, parameter in self.named_parameters()
+                   if parameter.requires_grad}
++        params.update({"message." + name: value for name, value in self.message.named_buffers()})
+         if set(state) != set(params):
+             raise ValueError("trainable parameter membership differs")
+         with torch.no_grad():
+@@ -136,9 +139,10 @@
+     def parameter_budget(self) -> dict[str, int]:
+         base = self.base.parameter_budget()
+         return {
++            **({"extra_edge_codebook_trainable": self.message.codebook.numel()} if self.message.codec_type == "grouped_vq8" else {}),
+             "matched_C_edge_trainable": int(base["edge_trainable"]),
+-            "extra_edge_codebook_trainable": self.message.codebook.numel(),
+-            "cloud_encoder_trainable": sum(p.numel() for p in self.message.encoder.parameters()),
++            "extra_edge_decode_trainable": sum(p.numel() for n, p in self.message.named_parameters() if not n.startswith("encoder.")),
++            "cloud_encoder_trainable": sum(p.numel() for n, p in self.message.named_parameters() if n.startswith("encoder.")),
+             "physical_wire_bytes": 8,
+             "edge_codebook_control_dim": EDGE_CONTROL_DIM,
+         }
+--- a/demo/latency_smoke.py
++++ b/demo/latency_smoke.py
+@@ -209,7 +209,7 @@
+     def finish_request(self):
+         require(self.current is not None and self.current["rounds"][-1]["done"], "unfinished trial")
+         row = {**self.current, "output_ids": self.generated, "timing": self.meter.finish(),
+-               "contract_id": digest(self.cfg)}
++               "contract_id": digest(self.cfg), "codec_binding": self.cfg.get("codec_binding")}
+         self.current = None
+         return row
+ 
+@@ -316,7 +316,7 @@
+         "accepted_draft_tokens": sum(r["accepted"] for r in rounds), "verification_rounds": len(rounds),
+         "framed_application_bytes_up": generation_up, "framed_application_bytes_down": generation_down,
+         "start_rpc_seconds": start_rpc, "timing": meter.finish(),
+-        "contract_id": digest(contract),
++        "contract_id": digest(contract), "codec_binding": contract.get("codec_binding"),
+         "draft_implementation": getattr(draft, "mode", "reference"),
+         "draft_cache_counters": dict(draft.stats) if hasattr(draft, "stats") else {}}
+ 
+@@ -341,7 +341,7 @@
+     import torch
+     from feedback_codec.hf_backend import _FrozenHFBackend, HFTargetBackend, HFDraftBackend
+     from feedback_codec.codec import CodecConfig
+-    from h_vq64_codec import ConditionedVQ64
++    from message_codecs import restore_codec
+     from h_vq64_head import HTaskHead
+     from safetensors import safe_open
+     state = checkpoint(config)
+@@ -359,8 +359,8 @@
+         require(free >= config.get("cloud_min_free_gib", 20) * 1024 ** 3,
+                 f"parallel cloud memory insufficient: free={free},total={total}")
+         target = HFTargetBackend(str(root / "Qwen3-8B"), None, device=device, dtype=torch.bfloat16)
+-        message = ConditionedVQ64(target_hidden_size=4096, draft_hidden_size=1024).to(device).eval()
+-        message.load_state_dict({name.removeprefix("message."): value for name, value in state.items() if name.startswith("message.")})
++        message = restore_codec(config["contract"]["codec_binding"],
++            {name.removeprefix("message."): value for name, value in state.items() if name.startswith("message.")}).to(device).eval()
+         message.requires_grad_(False)
+         table = None
+         for path in sorted((root / "Qwen3-0.6B").glob("*.safetensors")):
+@@ -378,8 +378,10 @@
+         teacher_hidden = HFDraftBackend.teacher_hidden
+     backend = DraftBackend(str(root / "Qwen3-0.6B"), None, device=device, dtype=torch.bfloat16)
+     head = HTaskHead(CodecConfig(4096, 1024, backend.vocab_size), backend.model.get_output_embeddings(),
+-                     draft_embedding=backend.model.get_input_embeddings()).to(device)
++                     draft_embedding=backend.model.get_input_embeddings(), codec_type=config["contract"]["codec_binding"]["codec_type"]).to(device)
+     head.load_trainable_state_dict(state)
++    from message_codecs import binding
++    require(binding(head.message) == config["contract"]["codec_binding"], "edge codec state differs")
+     head.requires_grad_(False).eval()
+     implementation = config["contract"].get("draft_implementation", "reference")
+     if implementation != "reference":
+@@ -479,6 +481,15 @@
+         require(contracts == {digest(expected_contract)} and
+                 implementations == {expected_contract.get("draft_implementation", "reference")},
+                 "rows differ from completed contract or implementation")
++    identities = [r.get("codec_binding") for r in client + cloud_rows]
++    require(all(item == identities[0] for item in identities), "mixed codec schema or state")
++    identity = identities[0]
++    require(isinstance(identity, dict) and identity.get("codec_type") in ("grouped_vq8", "pca_int8", "mlp_int8")
++            and identity.get("bits") == 64 and all(isinstance(identity.get(k), str) and len(identity[k]) == 64
++            and all(c in "0123456789abcdef" for c in identity[k]) for k in ("state_sha256", "schema_sha256")),
++            "missing codec schema, budget or state binding")
++    if expected_contract is not None:
++        require(identities[0] == expected_contract.get("codec_binding"), "codec differs from contract")
+     paired = defaultdict(dict)
+     for row in client:
+         remote = server[row["trial_id"]]
+@@ -499,6 +510,7 @@
+         require(all(r["request_id"] == group["raw"]["request_id"] and
+                     r["output_ids"] == group["raw"]["output_ids"] for r in group.values()),
+                 "paired request or Target output differs")
++        require([r["accepted"] for r in group["raw"]["rounds"]] == [r["accepted"] for r in group["shadow"]["rounds"]], "shadow changed accept counts")
+         require([r["candidate_ids"] for r in group["raw"]["rounds"]]
+                 == [r["candidate_ids"] for r in group["shadow"]["rounds"]], "shadow changed Draft decisions")
+     from statistics import median
+@@ -543,7 +555,7 @@
+                 ("edge", "edge_head_including_projection")]}}
+     differences = {arm + "_minus_raw_seconds": [g[arm]["wall_seconds"] - g["raw"]["wall_seconds"] for g in paired.values()]
+                    for arm in ("shadow", "active")}
+-    write(out, {"status": "complete", "arms": reports, "paired_differences": differences,
++    write(out, {"status": "complete", "codec_binding": identities[0], "draft_implementation": next(iter(implementations)), "contract_id": next(iter(contracts)), "arms": reports, "paired_differences": differences,
+         "scope": "Small concurrent-load smoke. Shadow adds codec+repair work but keeps exact RAW proposals. Nested decode/head timings must not be added twice; RPC residual includes framing/serialization/transport, not pure network RTT. Byte counts are application frames, not TCP/IP capture."})
+ 
+ 
+--- /dev/null
++++ b/demo/message_codecs.py
+@@ -0,0 +1,151 @@
++"""Eight-byte causal feedback codecs; endpoints agree on schema and exact state."""
++import hashlib
++import json
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++from h_vq64_codec import CausalCodec, ConditionedVQ64, EDGE_CONTROL_DIM, WIRE_BYTES
++
++METHODS = ("pca_int8", "mlp_int8", "grouped_vq8")
++
++
++class SignedCodec(CausalCodec):
++    def __init__(self, target_hidden_size, draft_hidden_size):
++        super().__init__()
++        if min(target_hidden_size, draft_hidden_size) < 1:
++            raise ValueError("hidden sizes must be positive")
++        self.target_hidden_size = target_hidden_size
++        self.draft_hidden_size = draft_hidden_size
++        self.conditioned = True
++        self.width = target_hidden_size + 2 * draft_hidden_size + 1
++        self.decoder = nn.Linear(WIRE_BYTES, EDGE_CONTROL_DIM)
++        self.register_buffer("scale", torch.full((WIRE_BYTES,), 1 / 127))
++
++    def _apply(self, fn, recurse=True):
++        # The wire uses the same pre-shared FP32 scales when model weights change precision.
++        scales = self.scale
++        super()._apply(fn, recurse)
++        self.scale = scales.to(device=self.scale.device, dtype=torch.float32)
++        return self
++
++    def coordinates(self, *inputs):
++        return self.project(self._inputs(*inputs))
++
++    def normalized(self, z):
++        if not torch.isfinite(z).all() or not torch.isfinite(self.scale).all() or not (self.scale > 0).all():
++            raise ValueError("invalid coordinates or shared scale")
++        return z.float() / self.scale.float()
++
++    def pack(self, z):
++        q = self.normalized(z).round().clamp(-127, 127).to(torch.int8)
++        return q.reshape(WIRE_BYTES).cpu().contiguous().numpy().tobytes()
++
++    @torch.no_grad()
++    def encode_payload(self, *inputs):
++        return self.pack(self.coordinates(*inputs))
++
++    def decode_payload(self, payload):
++        weight = self.decoder.weight
++        if payload is None:
++            return weight.new_zeros(1, EDGE_CONTROL_DIM)
++        if type(payload) is not bytes:
++            raise TypeError("expected raw bytes")
++        if len(payload) != WIRE_BYTES or 128 in payload:
++            raise ValueError("invalid symmetric int8 payload")
++        signed = [v if v < 128 else v - 256 for v in payload]
++        q = weight.new_tensor(signed).reshape(1, WIRE_BYTES)
++        return self.decoder((q.float() * self.scale.float()).to(weight.dtype))
++
++    def train_control(self, *inputs, temperature=1.0):
++        if not 0 < temperature <= 10:
++            raise ValueError("invalid temperature")
++        u = self.normalized(self.coordinates(*inputs)).clamp(-127, 127)
++        q = u.detach().round() + (u - u.detach())
++        return self.decoder((q * self.scale.float()).to(self.decoder.weight.dtype))
++
++
++class PCAInt8(SignedCodec):
++    codec_type = "pca_int8"
++
++    def __init__(self, target_hidden_size, draft_hidden_size):
++        super().__init__(target_hidden_size, draft_hidden_size)
++        self.register_buffer("mean", torch.zeros(self.width))
++        self.register_buffer("projection", torch.zeros(8, self.width))
++        self.register_buffer("fitted", torch.tensor(False))
++
++    @torch.no_grad()
++    def fit(self, records):
++        """Each record is (split, request_id, causal_inputs); one frozen fit."""
++        if self.fitted.item():
++            raise ValueError("PCA already fitted")
++        rows = []
++        for split, request_id, inputs in records:
++            if split != "train" or not request_id:
++                raise ValueError("PCA requires identified train requests")
++            rows.append(self._inputs(*inputs).detach().cpu().double())
++        if len(rows) < 9 or self.width < 8:
++            raise ValueError("insufficient centered PCA samples or features")
++        x = torch.cat(rows)
++        mean = x.mean(0)
++        centered = x - mean
++        _, singular, axes = torch.linalg.svd(centered, full_matrices=False)
++        if singular[7] <= singular[0] * max(x.shape) * torch.finfo(x.dtype).eps:
++            raise ValueError("insufficient PCA rank")
++        axes = axes[:8]
++        # Orient each component by its largest absolute loading.
++        signs = axes[torch.arange(8), axes.abs().argmax(1)].sign()
++        self.mean.copy_(mean)
++        self.projection.copy_(axes * signs[:, None])
++        stored = (x.to(self.mean) - self.mean) @ self.projection.T
++        self.scale.copy_(stored.float().abs().amax(0).div(127).clamp_min(1e-8))
++        self.fitted.fill_(True)
++
++    def project(self, x):
++        if not self.fitted.item():
++            raise ValueError("PCA not fitted")
++        return F.linear(x - self.mean, self.projection)
++
++
++class MLPInt8(SignedCodec):
++    codec_type = "mlp_int8"
++
++    def __init__(self, target_hidden_size, draft_hidden_size):
++        super().__init__(target_hidden_size, draft_hidden_size)
++        self.encoder = nn.Sequential(nn.Linear(self.width, 128), nn.SiLU(), nn.Linear(128, 8), nn.Tanh())
++
++    def project(self, x):
++        return self.encoder(x)
++
++
++def make_codec(codec_type, target_hidden_size, draft_hidden_size):
++    factories = {"pca_int8": PCAInt8, "mlp_int8": MLPInt8, "grouped_vq8": ConditionedVQ64}
++    if codec_type not in factories:
++        raise ValueError("unknown codec type")
++    return factories[codec_type](target_hidden_size=target_hidden_size, draft_hidden_size=draft_hidden_size)
++
++
++def binding(codec):
++    rule = {"pca_int8": "centered-train-svd8-maxabs/127-eps1e-8",
++            "mlp_int8": "linear128-silu-linear8-tanh-scale1/127",
++            "grouped_vq8": "argmax8x256-codebook16"}[codec.codec_type]
++    schema = {"version": 1, "codec_type": codec.codec_type, "bits": 64, "control_dim": 128,
++              "target_hidden": codec.target_hidden_size, "draft_hidden": codec.draft_hidden_size,
++              "conditioned": codec.conditioned, "rule": rule,
++              "wire": "group-order-u8" if codec.codec_type == "grouped_vq8" else "coord-order-i8-rne-symmetric"}
++    spec = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
++    digest = hashlib.sha256(spec.encode())
++    for name, value in sorted(codec.state_dict().items()):
++        digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode() + b"\0")
++        digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
++    return {**schema, "schema_sha256": spec, "state_sha256": digest.hexdigest()}
++
++
++def restore_codec(identity, state):
++    """Validate on a fresh instance so a failed load cannot mutate live state."""
++    codec = make_codec(identity["codec_type"], identity["target_hidden"], identity["draft_hidden"])
++    codec.load_state_dict({k: v.detach().clone() for k, v in state.items()}, strict=True, assign=True)
++    if binding(codec) != identity:
++        raise ValueError("codec schema or state hash mismatch")
++    return codec
+--- a/demo/variant_config.json
++++ b/demo/variant_config.json
+@@ -19,11 +19,13 @@
+     "repeats": 2,
+     "roster_sha256": "c82f4638053edf270af105042ea2c1ffa4ac62ea8caeaf9976e6815eb0ccbd37",
+     "source_sha256": {
++      "cached_draft.py": "dde74d221df0bd05cee967fe59ac709808067396b4ca3bf5a4c94a68bdf5fa95",
+       "causal_operands.py": "1650df1ccdb20df23daf1f24bd1fcc863f12f6bdc78e07387ed18a9a5d4f4885",
+-      "cpu_test.py": "2284a2a46d22b9849ca25b8ad55c9172f59cc3480c66b8ba139de06860674f0d",
+-      "h_vq64_codec.py": "d7a70352e64330dfca37c5075ff015ddbc865f7a106eb03eb36770d80981e726",
+-      "h_vq64_head.py": "8535e9535309e263e62aa07e59eb4c5301a8783e871598dcbcd0b1b053271b4b",
+-      "latency_smoke.py": "892680cb5a84b2fe1c6b97647e46d87234612f72cb57e271844aa019596f671e",
++      "cpu_test.py": "0fb337c5b8d397ac40df2d2f05442875965301f67bfc5630d14f5451d6f02f71",
++      "h_vq64_codec.py": "c81604f59b5ea3d113618c9f67eac21040773bffc08e15ce45cc6a9b4de80b2b",
++      "h_vq64_head.py": "504f5ecc92083d2a85c237fe038b89983c48e62a8d4a2725f55e9e8b6d10529e",
++      "latency_smoke.py": "7c86c6f8876b9d4199b547ac8e1135c5d55c2f3e0c3b87b003564936967b1b36",
++      "message_codecs.py": "169ff21368a34ffc6d14fe539442c5177898ef45e9f575328de464a76a614c57",
+       "seal_config.py": "4ecbcde44ffd6b4fe83f3361a40c89ea42d50bdc25ec894d24786e67b1527384",
+       "vendor/feedback_codec/__init__.py": "b50f9d478fb3141111e98b6724613fa40bdda07ba0e5e25852a7744ef3a7c89a",
+       "vendor/feedback_codec/cloud_edge.py": "1190d80a0ba0e298b3a1e000ae1ab122f7ff5c88dfe4adae810a6a2f78888de4",
+@@ -57,13 +59,26 @@
+       "vendor/feedback_codec/v12_round_assembly.py": "ec326507a402e44ba29adfe702dfaedd380e2047c8582150b98566e700e8b92b",
+       "vendor/feedback_codec/v12_storage.py": "e58ae9b85324ee5871f9e02b46d852b1f4ea25669d6d9961e37504e9ebfe2c62",
+       "vendor/feedback_codec/v2_p1_packed.py": "921d18bdd536fcdf7c437864da867c80c2fc8f2fff62210effbc54a38f5a8751",
+-      "vendor/feedback_codec/v2_upper_bound.py": "d7c7319ccd99e42c2dd1104eccc37f567d6ff79e4c589a4111c9e1843e6a39b9",
+-      "cached_draft.py": "dde74d221df0bd05cee967fe59ac709808067396b4ca3bf5a4c94a68bdf5fa95"
++      "vendor/feedback_codec/v2_upper_bound.py": "d7c7319ccd99e42c2dd1104eccc37f567d6ff79e4c589a4111c9e1843e6a39b9"
+     },
+     "window": 8,
+     "reference_contract_id": "ac4341ae4c1575847b565a7b9bfd726b452756ed03727ca151024b3dc58e7007",
+     "draft_implementation": "kv",
+-    "scope": "Draft inference reuse only; cloud Target remains the sealed reference verifier"
++    "scope": "Draft inference reuse only; cloud Target remains the sealed reference verifier",
++    "codec_binding": {
++      "version": 1,
++      "codec_type": "grouped_vq8",
++      "bits": 64,
++      "control_dim": 128,
++      "target_hidden": 4096,
++      "draft_hidden": 1024,
++      "conditioned": true,
++      "rule": "argmax8x256-codebook16",
++      "wire": "group-order-u8",
++      "schema_sha256": "991d4f5d4aae0342840fa14a4e7d02ad2f9850e296dd863cf80d44cbf60d68f4",
++      "state_sha256": "88259657a009b937e53d0d8790ddc08aeaad4f99c3157ea96792bae9c6e24cf2"
++    },
++    "parent_review_contract": "e99bc4710666ea02b4400bdcb3434d931085418c15b850fd71e6c8593664409b"
+   },
+   "edge_device": "cuda:0",
+   "edge_model_manifest": "/mnt/files2/dream/feedback-coded-specdec-v2/runs/v13-single-run-20261102/task64_latency_smoke_20261119/assets/models.json",
+--- a/demo/variant_manifest.json
++++ b/demo/variant_manifest.json
+@@ -1,51 +1,75 @@
+ {
+-  "reference_contract_id": "ac4341ae4c1575847b565a7b9bfd726b452756ed03727ca151024b3dc58e7007",
+-  "variant_contract_id": "e99bc4710666ea02b4400bdcb3434d931085418c15b850fd71e6c8593664409b",
+-  "mode": "kv",
+-  "original_reference_unchanged": true,
+-  "GPU_or_model_execution": false,
+-  "readiness": "Local CPU review; production BF16 parity and two-host timing pending",
+-  "source_sha256": {
+-    "causal_operands.py": "1650df1ccdb20df23daf1f24bd1fcc863f12f6bdc78e07387ed18a9a5d4f4885",
+-    "cpu_test.py": "2284a2a46d22b9849ca25b8ad55c9172f59cc3480c66b8ba139de06860674f0d",
+-    "h_vq64_codec.py": "d7a70352e64330dfca37c5075ff015ddbc865f7a106eb03eb36770d80981e726",
+-    "h_vq64_head.py": "8535e9535309e263e62aa07e59eb4c5301a8783e871598dcbcd0b1b053271b4b",
+-    "latency_smoke.py": "892680cb5a84b2fe1c6b97647e46d87234612f72cb57e271844aa019596f671e",
+-    "seal_config.py": "4ecbcde44ffd6b4fe83f3361a40c89ea42d50bdc25ec894d24786e67b1527384",
+-    "vendor/feedback_codec/__init__.py": "b50f9d478fb3141111e98b6724613fa40bdda07ba0e5e25852a7744ef3a7c89a",
+-    "vendor/feedback_codec/cloud_edge.py": "1190d80a0ba0e298b3a1e000ae1ab122f7ff5c88dfe4adae810a6a2f78888de4",
+-    "vendor/feedback_codec/codec.py": "75c3c1e7a4d0e81bbc1ecdeeca177ad504745d60afd4584e0932daeb198a06c6",
+-    "vendor/feedback_codec/cost_model.py": "37fc5b55e056453d8d66ceb133d64fc387b560fc5e1447e06356d224f1fb5114",
+-    "vendor/feedback_codec/decoding.py": "3a8ad56b186e5e64bf8dc1bb832192d5efc5b557457546bd79e4fb1eb4c906fc",
+-    "vendor/feedback_codec/evaluation.py": "88f7dd4b21ebdaa0d4cb46c430f483d5f49f1f032ba70ace7e1cd04159e444df",
+-    "vendor/feedback_codec/fixed_probe.py": "184b513346934a01f8b3fec6f4517525eee0be2e143fa41513c54cf1642343f0",
+-    "vendor/feedback_codec/hf_backend.py": "a24f7bc95745df165fa9e1d3ad2a6110afca38f8f68268a6da755a22fdb36632",
+-    "vendor/feedback_codec/losses.py": "2c7243da6f7868c4de5fcc822c43592a6737d4ade48809614c62fb44eaefeda4",
+-    "vendor/feedback_codec/packed.py": "c719e263682f4655efc3fcec3a43a8e05986ee60906224e9b1a7c0accfeec427",
+-    "vendor/feedback_codec/packed_probe.py": "f40afe8aed8a32a0475dc78cdd18666214111c76e53cff79a11214204d827765",
+-    "vendor/feedback_codec/packed_probe_numeric_v2.py": "ebb08c113cd120eeb36400385ea2660a502b988fff770ef8492b71479c30cf82",
+-    "vendor/feedback_codec/packed_probe_numeric_v3.py": "3f25ecc6a7e5fa96bcbec3b7442294f205c1c8016ddea14341c8aa27c7e3410c",
+-    "vendor/feedback_codec/pipeline.py": "1247c27bf2ee9f48a26488bb9b1da987aa50d6185fd72b4af92292a5dbd0ed1e",
+-    "vendor/feedback_codec/training.py": "8860fdc5041f15e637b26edb85bf3cd8c61d89bbff35a272ba48bd044682e6cd",
+-    "vendor/feedback_codec/v10_closed_loop.py": "dd8bf2e4adad93028478783edd12a0ae554d7cb8f64fdff891f11f703e3a9749",
+-    "vendor/feedback_codec/v10_collect_one.py": "8f3a84fa2440819c3a64f81c83e73bd8af15e559faf13f2380cf681c341a9ce4",
+-    "vendor/feedback_codec/v10_four_arm.py": "85925af8cc6db232caf00aa2af373b7897111fc20d400f003bd3ee068328c44d",
+-    "vendor/feedback_codec/v10_train_smoke_reader.py": "7cb67bad1ed0068cd7f7b575d61c67bbc4b5d09a82b76b796db3490efc8614a3",
+-    "vendor/feedback_codec/v10_transformer_bcfh.py": "9cf1e539bc93ffe35b292f3cd887b7fd911ecaea4643b3da023b653e0ca95d55",
+-    "vendor/feedback_codec/v11_collect_one.py": "df24ed75bb9bab71b9d728290b5add9bffb2ce2def1b7a5772d8e1a6fcad779b",
+-    "vendor/feedback_codec/v11_full_contract.py": "0a0c1c50f402e981c7c4790400fb40849d12c9a8a3f8313fa089612cbcc795dd",
+-    "vendor/feedback_codec/v11_stats.py": "90e13d74999624028ea102dcdf06d127bb50cef1315f0c9a9837881894d989f2",
+-    "vendor/feedback_codec/v11_teacher_diagnostic.py": "d51766236ed598f52a0a777dbed0cd600e5458c6fe1021bbcbf2a2056a8efab4",
+-    "vendor/feedback_codec/v12_acceptance.py": "3191c8d30de745f45f8301ec7661565a286cc44607096768f483bbdca1c3863a",
+-    "vendor/feedback_codec/v12_boundary_reader.py": "765e729575f4b3e0eebc76a4fd3a5245608789f6e0b866b9f580bc0b825fd8c8",
+-    "vendor/feedback_codec/v12_collect_one.py": "b2b3fcd5261a872e21bbdc2f34ae3e8a2e65ec20d142afd020b57f393c73fad4",
+-    "vendor/feedback_codec/v12_draft_observer.py": "17943f91dc3b7ca0d6d70fb20fac69921b380a07dd230e4e6ce5af8b65005596",
+-    "vendor/feedback_codec/v12_oracle_observer.py": "72193b77380432be09ce083c88b22b389ae8ee55681cc511bdd651f15e853133",
+-    "vendor/feedback_codec/v12_round_assembly.py": "ec326507a402e44ba29adfe702dfaedd380e2047c8582150b98566e700e8b92b",
+-    "vendor/feedback_codec/v12_storage.py": "e58ae9b85324ee5871f9e02b46d852b1f4ea25669d6d9961e37504e9ebfe2c62",
+-    "vendor/feedback_codec/v2_p1_packed.py": "921d18bdd536fcdf7c437864da867c80c2fc8f2fff62210effbc54a38f5a8751",
+-    "vendor/feedback_codec/v2_upper_bound.py": "d7c7319ccd99e42c2dd1104eccc37f567d6ff79e4c589a4111c9e1843e6a39b9",
+-    "cached_draft.py": "dde74d221df0bd05cee967fe59ac709808067396b4ca3bf5a4c94a68bdf5fa95"
+-  },
+-  "parent_variant_contract_id": "c81e32113b4b6ced056eeb4bf1e2f5d393b4fe21a32150cef10b07db76ff8431"
+-}
++  "variant_contract_id": "8261689d1e00424072bfea39a0cd379ec856735d4a7b1343312e8c3165e171db",
++  "contract": {
++    "authorization": "user7f9a9515; parallel user0e39a9a6",
++    "checkpoint_sha256": "8be64061de63ee7283d3de0d320843669019f636c96ff71667461b15e0eda563",
++    "codec": "existing trained ConditionedVQ64 with matching HTaskHead",
++    "eos_token_id": 151645,
++    "max_new": 64,
++    "model_manifest_sha256": "3aa01f3c1f4b9bf488fbe696a374775e4ebf371be1a1836f5a1bda02256c3ee4",
++    "purpose": "3-request actual cloud-edge codec latency smoke, concurrent A100 training",
++    "repeats": 2,
++    "roster_sha256": "c82f4638053edf270af105042ea2c1ffa4ac62ea8caeaf9976e6815eb0ccbd37",
++    "source_sha256": {
++      "cached_draft.py": "dde74d221df0bd05cee967fe59ac709808067396b4ca3bf5a4c94a68bdf5fa95",
++      "causal_operands.py": "1650df1ccdb20df23daf1f24bd1fcc863f12f6bdc78e07387ed18a9a5d4f4885",
++      "cpu_test.py": "0fb337c5b8d397ac40df2d2f05442875965301f67bfc5630d14f5451d6f02f71",
++      "h_vq64_codec.py": "c81604f59b5ea3d113618c9f67eac21040773bffc08e15ce45cc6a9b4de80b2b",
++      "h_vq64_head.py": "504f5ecc92083d2a85c237fe038b89983c48e62a8d4a2725f55e9e8b6d10529e",
++      "latency_smoke.py": "7c86c6f8876b9d4199b547ac8e1135c5d55c2f3e0c3b87b003564936967b1b36",
++      "message_codecs.py": "169ff21368a34ffc6d14fe539442c5177898ef45e9f575328de464a76a614c57",
++      "seal_config.py": "4ecbcde44ffd6b4fe83f3361a40c89ea42d50bdc25ec894d24786e67b1527384",
++      "vendor/feedback_codec/__init__.py": "b50f9d478fb3141111e98b6724613fa40bdda07ba0e5e25852a7744ef3a7c89a",
++      "vendor/feedback_codec/cloud_edge.py": "1190d80a0ba0e298b3a1e000ae1ab122f7ff5c88dfe4adae810a6a2f78888de4",
++      "vendor/feedback_codec/codec.py": "75c3c1e7a4d0e81bbc1ecdeeca177ad504745d60afd4584e0932daeb198a06c6",
++      "vendor/feedback_codec/cost_model.py": "37fc5b55e056453d8d66ceb133d64fc387b560fc5e1447e06356d224f1fb5114",
++      "vendor/feedback_codec/decoding.py": "3a8ad56b186e5e64bf8dc1bb832192d5efc5b557457546bd79e4fb1eb4c906fc",
++      "vendor/feedback_codec/evaluation.py": "88f7dd4b21ebdaa0d4cb46c430f483d5f49f1f032ba70ace7e1cd04159e444df",
++      "vendor/feedback_codec/fixed_probe.py": "184b513346934a01f8b3fec6f4517525eee0be2e143fa41513c54cf1642343f0",
++      "vendor/feedback_codec/hf_backend.py": "a24f7bc95745df165fa9e1d3ad2a6110afca38f8f68268a6da755a22fdb36632",
++      "vendor/feedback_codec/losses.py": "2c7243da6f7868c4de5fcc822c43592a6737d4ade48809614c62fb44eaefeda4",
++      "vendor/feedback_codec/packed.py": "c719e263682f4655efc3fcec3a43a8e05986ee60906224e9b1a7c0accfeec427",
++      "vendor/feedback_codec/packed_probe.py": "f40afe8aed8a32a0475dc78cdd18666214111c76e53cff79a11214204d827765",
++      "vendor/feedback_codec/packed_probe_numeric_v2.py": "ebb08c113cd120eeb36400385ea2660a502b988fff770ef8492b71479c30cf82",
++      "vendor/feedback_codec/packed_probe_numeric_v3.py": "3f25ecc6a7e5fa96bcbec3b7442294f205c1c8016ddea14341c8aa27c7e3410c",
++      "vendor/feedback_codec/pipeline.py": "1247c27bf2ee9f48a26488bb9b1da987aa50d6185fd72b4af92292a5dbd0ed1e",
++      "vendor/feedback_codec/training.py": "8860fdc5041f15e637b26edb85bf3cd8c61d89bbff35a272ba48bd044682e6cd",
++      "vendor/feedback_codec/v10_closed_loop.py": "dd8bf2e4adad93028478783edd12a0ae554d7cb8f64fdff891f11f703e3a9749",
++      "vendor/feedback_codec/v10_collect_one.py": "8f3a84fa2440819c3a64f81c83e73bd8af15e559faf13f2380cf681c341a9ce4",
++      "vendor/feedback_codec/v10_four_arm.py": "85925af8cc6db232caf00aa2af373b7897111fc20d400f003bd3ee068328c44d",
++      "vendor/feedback_codec/v10_train_smoke_reader.py": "7cb67bad1ed0068cd7f7b575d61c67bbc4b5d09a82b76b796db3490efc8614a3",
++      "vendor/feedback_codec/v10_transformer_bcfh.py": "9cf1e539bc93ffe35b292f3cd887b7fd911ecaea4643b3da023b653e0ca95d55",
++      "vendor/feedback_codec/v11_collect_one.py": "df24ed75bb9bab71b9d728290b5add9bffb2ce2def1b7a5772d8e1a6fcad779b",
++      "vendor/feedback_codec/v11_full_contract.py": "0a0c1c50f402e981c7c4790400fb40849d12c9a8a3f8313fa089612cbcc795dd",
++      "vendor/feedback_codec/v11_stats.py": "90e13d74999624028ea102dcdf06d127bb50cef1315f0c9a9837881894d989f2",
++      "vendor/feedback_codec/v11_teacher_diagnostic.py": "d51766236ed598f52a0a777dbed0cd600e5458c6fe1021bbcbf2a2056a8efab4",
++      "vendor/feedback_codec/v12_acceptance.py": "3191c8d30de745f45f8301ec7661565a286cc44607096768f483bbdca1c3863a",
++      "vendor/feedback_codec/v12_boundary_reader.py": "765e729575f4b3e0eebc76a4fd3a5245608789f6e0b866b9f580bc0b825fd8c8",
++      "vendor/feedback_codec/v12_collect_one.py": "b2b3fcd5261a872e21bbdc2f34ae3e8a2e65ec20d142afd020b57f393c73fad4",
++      "vendor/feedback_codec/v12_draft_observer.py": "17943f91dc3b7ca0d6d70fb20fac69921b380a07dd230e4e6ce5af8b65005596",
++      "vendor/feedback_codec/v12_oracle_observer.py": "72193b77380432be09ce083c88b22b389ae8ee55681cc511bdd651f15e853133",
++      "vendor/feedback_codec/v12_round_assembly.py": "ec326507a402e44ba29adfe702dfaedd380e2047c8582150b98566e700e8b92b",
++      "vendor/feedback_codec/v12_storage.py": "e58ae9b85324ee5871f9e02b46d852b1f4ea25669d6d9961e37504e9ebfe2c62",
++      "vendor/feedback_codec/v2_p1_packed.py": "921d18bdd536fcdf7c437864da867c80c2fc8f2fff62210effbc54a38f5a8751",
++      "vendor/feedback_codec/v2_upper_bound.py": "d7c7319ccd99e42c2dd1104eccc37f567d6ff79e4c589a4111c9e1843e6a39b9"
++    },
++    "window": 8,
++    "reference_contract_id": "ac4341ae4c1575847b565a7b9bfd726b452756ed03727ca151024b3dc58e7007",
++    "draft_implementation": "kv",
++    "scope": "Draft inference reuse only; cloud Target remains the sealed reference verifier",
++    "codec_binding": {
++      "version": 1,
++      "codec_type": "grouped_vq8",
++      "bits": 64,
++      "control_dim": 128,
++      "target_hidden": 4096,
++      "draft_hidden": 1024,
++      "conditioned": true,
++      "rule": "argmax8x256-codebook16",
++      "wire": "group-order-u8",
++      "schema_sha256": "991d4f5d4aae0342840fa14a4e7d02ad2f9850e296dd863cf80d44cbf60d68f4",
++      "state_sha256": "88259657a009b937e53d0d8790ddc08aeaad4f99c3157ea96792bae9c6e24cf2"
++    },
++    "parent_review_contract": "e99bc4710666ea02b4400bdcb3434d931085418c15b850fd71e6c8593664409b"
++  }
++}--- /dev/null
++++ b/run_bench.ps1
+@@ -0,0 +1,12 @@
++param(
++    [string]$TestRoot=(Join-Path $PSScriptRoot 'release-tests'),
++    [string]$Out=(Join-Path $PSScriptRoot ('bench-' + [guid]::NewGuid().ToString('N'))),
++    [string]$Python='C:/Users/asus/.raft/agents/6946fc4f-34e5-42f8-abf5-cd3fd9376a5e/review-v71-next-heads-20261108/cpu-env/Scripts/python.exe',
++    [string]$Deps='C:/Users/asus/.raft/agents/6946fc4f-34e5-42f8-abf5-cd3fd9376a5e/task58-draft-opd/cpu-deps'
++)
++$env:PYTHONPATH=$Deps
++$env:HF_HUB_OFFLINE='1'
++$env:CUDA_VISIBLE_DEVICES=''
++$env:PYTHONDONTWRITEBYTECODE='1'
++& $Python (Join-Path $PSScriptRoot 'tests/bench_codecs.py') $TestRoot $Out
++exit $LASTEXITCODE
+--- /dev/null
++++ b/run_tests.ps1
+@@ -0,0 +1,37 @@
++param(
++    [string]$Out = (Join-Path $PSScriptRoot ('test-' + [guid]::NewGuid().ToString('N'))),
++    [string]$Python = 'C:/Users/asus/.raft/agents/6946fc4f-34e5-42f8-abf5-cd3fd9376a5e/review-v71-next-heads-20261108/cpu-env/Scripts/python.exe',
++    [string]$Deps = 'C:/Users/asus/.raft/agents/6946fc4f-34e5-42f8-abf5-cd3fd9376a5e/task58-draft-opd/cpu-deps'
++)
++$ErrorActionPreference = 'Stop'
++$env:PYTHONPATH=$Deps
++$env:HF_HUB_OFFLINE='1'
++$env:PYTHONDONTWRITEBYTECODE='1'
++$env:CUDA_VISIBLE_DEVICES=''
++$env:KV_REVIEW_DEMO=Join-Path $PSScriptRoot 'demo'
++$outDir=(New-Item -ItemType Directory -Path $Out).FullName
++function Run([string]$name, [string[]]$arguments) {
++    & $Python @arguments *> (Join-Path $outDir "$name.log")
++    if ($LASTEXITCODE -ne 0) { throw "Failed $name. See $outDir/$name.log" }
++    Write-Output "$name passed"
++}
++Push-Location $PSScriptRoot
++try {
++    $cfg=Get-Content -Raw demo/variant_config.json | ConvertFrom-Json
++    foreach ($prop in $cfg.contract.source_sha256.PSObject.Properties) {
++        if ((Get-FileHash (Join-Path demo $prop.Name)).Hash -ne $prop.Value) { throw "Source mismatch $($prop.Name)" }
++    }
++    Run train @('tests/train_codecs.py',$outDir)
++    Run regression @('tests/review_regression.py')
++    Run parity @('tests/cpu_parity.py','--out',"$outDir/parity.json")
++    Run terminal @('tests/independent_terminal_parity.py','--out',"$outDir/terminal.json")
++    foreach ($method in 'pca_int8','mlp_int8','grouped_vq8') {
++        foreach ($mode in 'reference','kv') {
++            Run "$method-$mode" @('demo/cpu_test.py','--codec',$method,'--implementation',$mode,'--checkpoint',"$outDir/$method.pt",'--out',"$outDir/$method-$mode")
++        }
++    }
++    Run legacy @('demo/cpu_test.py','--implementation','kv','--out',"$outDir/legacy")
++    Run precision @('tests/precision_check.py',$outDir)
++    Run audit @('tests/audit_methods.py',$outDir)
++} finally { Pop-Location }
++Write-Output "Evidence $outDir"
+--- /dev/null
++++ b/tests/audit_methods.py
+@@ -0,0 +1,92 @@
++"""Verify cross-implementation trajectories, negative aggregation, and frozen VQ behavior."""
++import argparse
++import contextlib
++import functools
++import importlib.util
++import json
++from pathlib import Path
++import tempfile
++from unittest.mock import patch
++
++import cpu_parity as fixture
++from train_codecs import METHODS, ROOT, binding, make_codec, rejects, torch
++
++
++def read_rows(root):
++    return {r["trial_id"]: r for path in (root / "edge/rows").glob("*.json")
++            for r in [json.loads(path.read_bytes())]}
++
++
++def trajectory(row):
++    return (row["output_ids"], [(r["candidate_ids"], r["accepted"], r["committed_ids"], r["feedback_bytes"])
++                                for r in row["rounds"]])
++
++
++def negative_summary(root):
++    source = root / "pca_int8-kv"
++    trial = next(r for r in read_rows(source).values() if r["arm"] == "active")
++    result = []
++    for key, value in [("codec_type", "grouped_vq8"), ("state_sha256", "a" * 64), ("bits", 32)]:
++        with tempfile.TemporaryDirectory() as tmp:
++            edges = Path(tmp) / "edge/rows"
++            edges.mkdir(parents=True)
++            for p in (source / "edge/rows").glob("*.json"):
++                row = json.loads(p.read_bytes())
++                if row["trial_id"] == trial["trial_id"]:
++                    row["codec_binding"][key] = value
++                (edges / p.name).write_text(json.dumps(row))
++            try:
++                fixture.smoke.summarize(edges.parent, source / "cloud", Path(tmp) / "out.json")
++            except ValueError as e:
++                assert "mixed codec" in str(e)
++            else:
++                raise AssertionError("mixed codec accepted")
++            result.append(key)
++    return result
++
++
++def old_vq():
++    src = ROOT / "tests/baseline_vq.py"
++    import hashlib
++    assert hashlib.sha256(src.read_bytes()).hexdigest() == "d7a70352e64330dfca37c5075ff015ddbc865f7a106eb03eb36770d80981e726"
++    spec = importlib.util.spec_from_file_location("reviewed_vq", src)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    old = mod.ConditionedVQ64(target_hidden_size=32, draft_hidden_size=32)
++    new = make_codec("grouped_vq8", 32, 32)
++    new.load_state_dict(old.state_dict())
++    for accepted in range(9):
++        x = (torch.randn(1, 32), accepted, torch.randn(1, 32) if accepted < 8 else None, torch.randn(1, 32))
++        a, b = old.encode_payload(*x), new.encode_payload(*x)
++        assert a == b and torch.equal(old.decode_payload(a), new.decode_payload(b))
++        assert torch.equal(old.train_control(*x), new.train_control(*x))
++    return 9
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("out", type=Path)
++    root = parser.parse_args().out
++    torch.set_num_threads(1)
++    report = {"reviewed_vq_wire_control_cases": old_vq(), "mixed_summary_rejected": negative_summary(root),
++              "methods": {}}
++    original = read_rows(ROOT / "evidence/tcp-kv")
++    rerun = read_rows(root / "legacy")
++    assert len(original) == len(rerun) == 9
++    assert all(trajectory(original[k]) == trajectory(rerun[k]) for k in original)
++    report["legacy_exact_tcp_trajectories"] = len(original)
++    for method in METHODS:
++        reference, cached = [read_rows(root / (method + "-" + mode)) for mode in ["reference", "kv"]]
++        assert len(reference) == len(cached) == 9
++        for key, r in reference.items():
++            assert trajectory(r) == trajectory(cached[key])
++            assert r["feedback_hex"] == cached[key]["feedback_hex"]
++        data = torch.load(root / (method + ".pt"), weights_only=True)
++        with patch.object(fixture, "make", functools.partial(fixture.make, codec_checkpoint=data)):
++            branches = fixture.forced_branches(121, torch.float32, "kv")["forced_rejection_and_bonus"]
++            terminal = fixture.integrated_terminal_gate(torch.float32)
++        report["methods"][method] = {"tcp_reference_kv_identical": 9, "same_wire_per_round": True,
++                                     "forced_accept_counts": [r["accepted"] for r in branches],
++                                     "terminal_cases": len(terminal), "tested_cross_request_reset": True}
++    (root / "audit.json").write_text(json.dumps(report, indent=2))
++    print(json.dumps(report))
+--- /dev/null
++++ b/tests/bench_codecs.py
+@@ -0,0 +1,166 @@
++"""Single-thread CPU timings. Latencies are host wall microseconds and overlap by design."""
++import argparse
++from collections import defaultdict
++import hashlib
++import json
++import os
++from pathlib import Path
++import platform
++import statistics
++import sys
++from unittest.mock import patch
++import time
++
++import cpu_parity as fx
++from train_codecs import METHODS, ROOT, binding, make_codec, restore_codec, setup, torch
++import cpu_test
++from feedback_codec.fixed_probe import ProtocolView
++from h_vq64_head import MessageState
++
++
++def stats(values):
++    ordered = sorted(values)
++    index = .95 * (len(ordered) - 1)
++    low = int(index)
++    return {"n": len(values), "p50_us": statistics.median(ordered), "mean_us": statistics.mean(ordered),
++            "p95_us": ordered[low] + (ordered[min(low + 1, len(ordered)-1)] - ordered[low]) * (index-low)}
++
++
++def measured(fn, *args):
++    start = time.perf_counter_ns()
++    value = fn(*args)
++    return value, (time.perf_counter_ns() - start) / 1000.
++
++
++def sample(h, d, i, generator):
++    def normal(width):
++        return torch.randn(1, width, generator=generator)
++    return normal(h), i % 9, None if i % 9 == 8 else normal(d), normal(d)
++
++
++def config(path):
++    raw = path.read_bytes()
++    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
++            "hidden_size": json.loads(raw)["hidden_size"]}
++
++
++@torch.inference_mode()
++def run(args):
++    torch.set_num_threads(1)
++    torch.manual_seed(32)
++    model = [config(args.target_config), config(args.draft_config)]
++    out = args.out
++    out.mkdir(parents=True, exist_ok=True)
++    report = {"environment": {"cpu": platform.processor(), "torch": str(torch.__version__),
++                              "transformers": fx.transformers.__version__, "threads": torch.get_num_threads(),
++                              "dtype": "float32", "gpu_event_us": None}, "model_configs": model,
++              "warmup_per_method": args.warmup, "repeats_each_round": args.iterations, "rounds": 3,
++              "scope": "tiny Qwen3 CPU localhost; production widths use random inputs and codec only",
++              "stages_overlap": True, "shapes": {}}
++    for scope, h, d in [("tiny", 32, 32), ("production_shape", *(m["hidden_size"] for m in model))]:
++        gen = torch.Generator().manual_seed(913)
++        fit = [("train", str(i), sample(h, d, i, gen)) for i in range(32)]
++        inputs = [sample(h, d, i, gen) for i in range(64)]
++        codecs, meta, cached = {}, {}, {}
++        for method in METHODS:
++            start = time.perf_counter_ns()
++            if scope == "tiny":
++                ck = torch.load(args.test_root / (method + ".pt"), weights_only=True)
++                codec = restore_codec(ck["binding"], ck["message"])
++            else:
++                codec = make_codec(method, h, d)
++            construct_us = (time.perf_counter_ns() - start)/1000
++            fit_us = None
++            if scope == "production_shape" and method == "pca_int8":
++                _, fit_us = measured(codec.fit, fit)
++            payload, first = measured(codec.encode_payload, *inputs[0])
++            _, cold_decode = measured(codec.decode_payload, payload)
++            codecs[method] = codec
++            meta[method] = {"binding": binding(codec), "payload_bytes": 8, "construct_or_load_us": construct_us,
++                            "first_encode_us": first, "first_decode_us": cold_decode, "offline_fit_us": fit_us,
++                            "parameters": sum(p.numel() for p in codec.parameters()),
++                            "parameter_bytes": sum(p.numel()*p.element_size() for p in codec.parameters()),
++                            "buffers_bytes": sum(p.numel()*p.element_size() for p in codec.buffers()),
++                            "receiver_bytes": sum(v.numel()*v.element_size() for n,v in codec.state_dict().items()
++                                                  if n == "scale" or n == "codebook" or n.startswith("decoder."))}
++            if scope == "tiny":
++                _, backend, head = setup(method)
++                head.message = codec
++                head.base.core.repair.U.weight.copy_(ck["repair_U"])
++                head.requires_grad_(False).eval()
++                draft = fx.CachedDraft(backend, head)
++                draft.reset(fx.smoke.Meter("cpu"))
++                reply = ProtocolView((1, 3, 4), 8, 0, 12, 4)
++                base = draft.head.base.prepare_view(reply, draft.backend)
++                cached[method] = (draft, base)
++        raw = {m: defaultdict(list) for m in METHODS}
++        clipped = {m: [0, 0] for m in METHODS}
++        for repeat in range(3):
++            for i in range(-args.warmup if repeat == 0 else 0, args.iterations):
++                x = inputs[(i + repeat * args.iterations) % len(inputs)]
++                offset = (i + repeat) % 3
++                for method in METHODS[offset:] + METHODS[:offset]:
++                    m = codecs[method]
++                    times = {}
++                    if method == "grouped_vq8":
++                        z, times["encoder"] = measured(m.logits, *x)
++                        b, times["quantize_pack"] = measured(lambda: m._wire(z.argmax(-1)))
++                    else:
++                        z, times["encoder"] = measured(m.coordinates, *x)
++                        b, times["quantize_pack"] = measured(m.pack, z)
++                        if i >= 0:
++                            clipped[method][0] += int((m.normalized(z).abs() > 127).sum())
++                            clipped[method][1] += 8
++                    _, times["decoder"] = measured(m.decode_payload, b)
++                    _, times["complete_codec"] = measured(lambda: m.decode_payload(m.encode_payload(*x)))
++                    if scope == "tiny":
++                        draft, base = cached[method]
++                        state = MessageState(base, (), b, base.corrected_prefix)
++                        ctrl, times["control_including_decode"] = measured(draft.build_control, state)
++                        _, times["repair_projection"] = measured(draft.head.base.core.repair.repair_from_control,
++                                                                  base.local_hidden, ctrl, 1)
++                    if i >= 0:
++                        for k, val in times.items():
++                            raw[method][k].append(val)
++        for method, (num, den) in clipped.items():
++            meta[method]["heldout_clipped_coordinate_fraction"] = num / den if den else None
++        report["shapes"][scope] = {"target_hidden": h, "draft_hidden": d, "input_dim": h+2*d+1, "codecs": meta,
++                                   "timings": {m: {k: stats(v) for k,v in t.items()} for m,t in raw.items()}}
++        (out / (scope + "-samples-us.json")).write_text(json.dumps(raw))
++    report["localhost_tcp"] = {}
++    # Each local connection warms all arms, then measures three paired requests.
++    # Rotate method order across independent connections to avoid a fixed startup order.
++    for rotation in range(3):
++        order = METHODS[rotation:] + METHODS[:rotation]
++        for method in order:
++            root = out / f"tcp-{rotation}-{method}"
++            options = ["cpu_test.py", "--codec", method, "--implementation", "kv",
++                       "--checkpoint", str(args.test_root / (method + ".pt")),
++                       "--out", str(root), "--warmup-rounds", "1", "--repeats", "1"]
++            with patch.object(sys, "argv", options), torch.inference_mode(False):
++                cpu_test.main()
++    for method in METHODS:
++        rows = [json.loads(p.read_bytes()) for p in out.glob(f"tcp-*-{method}/edge/rows/*.json")]
++        measured_rows = [r for r in rows if not r["warmup"]]
++        report["localhost_tcp"][method] = {}
++        for arm in fx.smoke.ARMS:
++            subset = [r for r in measured_rows if r["arm"] == arm]
++            assert len(subset) == 9
++            walls = [r["wall_seconds"] * 1e6 for r in subset]
++            report["localhost_tcp"][method][arm] = {**stats(walls), "samples_us": walls,
++                "framed_up_bytes": sum(r["framed_application_bytes_up"] for r in subset),
++                "framed_down_bytes": sum(r["framed_application_bytes_down"] for r in subset),
++                "feedback_bytes": sum(i["feedback_bytes"] for r in subset for i in r["rounds"])}
++    (out / "summary.json").write_text(json.dumps(report, indent=2))
++    print("saved", out / "summary.json")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("test_root", type=Path)
++    parser.add_argument("out", type=Path)
++    parser.add_argument("--target-config", type=Path, default=ROOT / "tests/model_configs/qwen3_8b.json")
++    parser.add_argument("--draft-config", type=Path, default=ROOT / "tests/model_configs/qwen3_0_6b.json")
++    parser.add_argument("--warmup", type=int, default=50)
++    parser.add_argument("--iterations", type=int, default=500)
++    run(parser.parse_args())
+--- /dev/null
++++ b/tests/bind_source.py
+@@ -0,0 +1,38 @@
++"""Seal the reviewed legacy production checkpoint to the multi-codec source tree."""
++import argparse
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++DEMO = ROOT / "demo"
++sys.path.insert(0, str(DEMO))
++from message_codecs import make_codec, binding
++import torch
++
++
++def sha(path):
++    with path.open("rb") as f:
++        return hashlib.file_digest(f, "sha256").hexdigest()
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("checkpoint", type=Path)
++    args = ap.parse_args()
++    config_path = DEMO / "variant_config.json"
++    config = json.loads(config_path.read_bytes())
++    contract = config["contract"]
++    if sha(args.checkpoint) != contract["checkpoint_sha256"]:
++        raise ValueError("legacy checkpoint changed")
++    state = torch.load(args.checkpoint, weights_only=True, map_location="cpu")["model"]
++    m = make_codec("grouped_vq8", 4096, 1024)
++    m.load_state_dict({k.removeprefix("message."): v for k, v in state.items() if k.startswith("message.")})
++    contract["codec_binding"] = binding(m)
++    contract["source_sha256"] = {p.relative_to(DEMO).as_posix(): sha(p) for p in sorted(DEMO.rglob("*.py"))}
++    contract["parent_review_contract"] = "e99bc4710666ea02b4400bdcb3434d931085418c15b850fd71e6c8593664409b"
++    config_path.write_text(json.dumps(config, indent=2) + "\n")
++    digest = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++    (DEMO / "variant_manifest.json").write_text(json.dumps({"variant_contract_id": digest, "contract": contract}, indent=2))
++    print(digest)
+--- a/tests/cpu_parity.py
++++ b/tests/cpu_parity.py
+@@ -26,7 +26,7 @@
+     teacher_hidden = HFDraftBackend.teacher_hidden
+ 
+ 
+-def make(seed, dtype, variant):
++def make(seed, dtype, variant, *, codec_checkpoint=None):
+     torch.manual_seed(seed)
+     cfg = Qwen3Config(vocab_size=97, hidden_size=32, intermediate_size=64,
+                      num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+@@ -35,7 +35,11 @@
+     cfg._attn_implementation = "eager"
+     backend = DraftBackend(Qwen3ForCausalLM(cfg), object(), device="cpu", dtype=dtype)
+     head = HTaskHead(CodecConfig(32, 32, 97), backend.model.get_output_embeddings(),
+-                     draft_embedding=backend.model.get_input_embeddings()).eval()
++                     draft_embedding=backend.model.get_input_embeddings(),
++                     codec_type=codec_checkpoint["binding"]["codec_type"] if codec_checkpoint else "grouped_vq8").eval()
++    if codec_checkpoint:
++        from message_codecs import restore_codec
++        head.message = restore_codec(codec_checkpoint["binding"], codec_checkpoint["message"]).eval()
+     # Exercise a nonzero trained-style residual; the default zero U is insufficient.
+     with torch.no_grad():
+         head.base.core.repair.U.weight.normal_(0, .08)
+--- /dev/null
++++ b/tests/model_configs/provenance.json
+@@ -0,0 +1,10 @@
++[
++  {
++    "Path": "C:\\Users\\asus\\Documents\\Codex\\2026-11-10\\w-x\\outputs\\A100-marker-handoff-20261114\\source_snapshot\\model_configs\\Qwen3-8B\\config.json",
++    "Hash": "F7C4EADFBBF522470667B797A3C89BE2524832D2D599797248DC304FFF447C30"
++  },
++  {
++    "Path": "C:\\Users\\asus\\Documents\\Codex\\2026-09-29\\n\\experiments\\specbranch-reproduction\\artifacts\\qwen3-0.6b-transfer\\config.json",
++    "Hash": "660DB3B73D788119C04535E48CF9BE5F55BC3100841A718637AE695B442F27DD"
++  }
++]
+--- /dev/null
++++ b/tests/model_configs/qwen3_0_6b.json
+@@ -0,0 +1,30 @@
++{
++  "architectures": [
++    "Qwen3ForCausalLM"
++  ],
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "bos_token_id": 151643,
++  "eos_token_id": 151645,
++  "head_dim": 128,
++  "hidden_act": "silu",
++  "hidden_size": 1024,
++  "initializer_range": 0.02,
++  "intermediate_size": 3072,
++  "max_position_embeddings": 40960,
++  "max_window_layers": 28,
++  "model_type": "qwen3",
++  "num_attention_heads": 16,
++  "num_hidden_layers": 28,
++  "num_key_value_heads": 8,
++  "rms_norm_eps": 1e-06,
++  "rope_scaling": null,
++  "rope_theta": 1000000,
++  "sliding_window": null,
++  "tie_word_embeddings": true,
++  "torch_dtype": "bfloat16",
++  "transformers_version": "4.51.0",
++  "use_cache": true,
++  "use_sliding_window": false,
++  "vocab_size": 151936
++}--- /dev/null
++++ b/tests/model_configs/qwen3_8b.json
+@@ -0,0 +1,30 @@
++{
++  "architectures": [
++    "Qwen3ForCausalLM"
++  ],
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "bos_token_id": 151643,
++  "eos_token_id": 151645,
++  "head_dim": 128,
++  "hidden_act": "silu",
++  "hidden_size": 4096,
++  "initializer_range": 0.02,
++  "intermediate_size": 12288,
++  "max_position_embeddings": 40960,
++  "max_window_layers": 36,
++  "model_type": "qwen3",
++  "num_attention_heads": 32,
++  "num_hidden_layers": 36,
++  "num_key_value_heads": 8,
++  "rms_norm_eps": 1e-06,
++  "rope_scaling": null,
++  "rope_theta": 1000000,
++  "sliding_window": null,
++  "tie_word_embeddings": false,
++  "torch_dtype": "bfloat16",
++  "transformers_version": "4.51.0",
++  "use_cache": true,
++  "use_sliding_window": false,
++  "vocab_size": 151936
++}--- /dev/null
++++ b/tests/precision_check.py
+@@ -0,0 +1,38 @@
++"""Compare saved CPU FP32 and BF16 codec behavior across every held-out request."""
++import argparse
++import copy
++import json
++from pathlib import Path
++
++from train_codecs import METHODS, dataset, setup, restore_codec, torch
++
++
++def check(method, root):
++    target, draft, head = setup(method)
++    data = torch.load(root / (method + ".pt"), weights_only=True)
++    fp32 = restore_codec(data["binding"], data["message"])
++    bf16 = copy.deepcopy(fp32).bfloat16()
++    results = []
++    for _, key, x, *_ in dataset(target, draft, head, "validation", range(40, 48)):
++        b0 = fp32.encode_payload(*x)
++        b1 = bf16.encode_payload(*x)
++        controls = [m.decode_payload(b) for m, b in [(fp32, b0), (bf16, b1)]]
++        errors = [float((m.train_control(*x).float() - c.float()).abs().max())
++                  for m, c in zip([fp32, bf16], controls)]
++        assert errors == [0., 0.]
++        results.append({"request": key, "fp32_bytes": b0.hex(), "bf16_bytes": b1.hex(),
++                        "identical_coordinates": sum(i == j for i, j in zip(b0, b1)),
++                        "wire_control_error_fp32_bf16": errors,
++                        "max_cross_dtype_control_difference": float((controls[0]-controls[1].float()).abs().max())})
++    return results
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("root", type=Path)
++    root = parser.parse_args().root
++    torch.set_num_threads(1)
++    with torch.no_grad():
++        results = {m: check(m, root) for m in METHODS}
++    (root / "precision.json").write_text(json.dumps(results, indent=2))
++    print("precision passed", {m: len(rows) for m, rows in results.items()})
+--- /dev/null
++++ b/tests/report_release.py
+@@ -0,0 +1,109 @@
++"""Build the Chinese report and portable source/evidence archive from passing receipts."""
++import difflib
++import hashlib
++import json
++from pathlib import Path
++import sys
++import zipfile
++
++ROOT = Path(__file__).resolve().parents[1]
++TEST = ROOT / "release-tests"
++BENCH = ROOT / "release-bench"
++METHODS = ("pca_int8", "mlp_int8", "grouped_vq8")
++
++
++def read(path):
++    return json.loads(path.read_bytes())
++
++
++def digest(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def original_diff(original):
++    files = [p for name in ("demo", "tests") for p in (ROOT/name).rglob("*")
++             if p.is_file() and p.suffix in {".py", ".json"} and p.name != "baseline_vq.py"]
++    files += [ROOT / n for n in ("run_tests.ps1", "run_bench.ps1")]
++    diff = []
++    for p in sorted(files):
++        name = p.relative_to(ROOT).as_posix()
++        old = original / name
++        before = old.read_text(encoding="utf-8-sig").splitlines(True) if old.exists() else []
++        after = p.read_text(encoding="utf-8-sig").splitlines(True)
++        diff.extend(difflib.unified_diff(before, after, fromfile="a/"+name if old.exists() else "/dev/null",
++                                         tofile="b/"+name))
++    (ROOT/"methods.patch").write_text("".join(diff), encoding="utf-8")
++
++
++def report():
++    bench = read(BENCH/"summary.json")
++    training = read(TEST/"training.json")
++    audit = read(TEST/"audit.json")
++    precision = read(TEST/"precision.json")
++    config = read(ROOT/"demo/variant_manifest.json")
++    assert len(audit["methods"]) == 3 and audit["legacy_exact_tcp_trajectories"] == 9
++    rows = ["# 三种八字节反馈方法的本机实测", "",
++        "独立副本以 e99bc471 为基线。三种方法各完成 24 步真实微型 Qwen3 下一 token 交叉熵训练，以及本机两端 TCP 验证。正式匹配训练、生产 GPU 推理与双机时延未运行。", "",
++        "## 正确性与训练", "",
++        "- 31 个训练请求、7 个验证请求来自分离的随机微型模型提示组。使用相同的 Draft、Target、非零 repair、种子和预算。教师给出纠正后的下一 token，冻结接收器仍参加反向计算。每种方法的全部预期参数都有有限非零梯度，冻结权重、PCA 与尺度 buffer 保持逐位不变。",
++        "- PCA 对训练输入做中心化 SVD，拒绝验证标签、少样本和秩不足。八个尺度按各分量训练绝对最大值除以 127 并设置 1e-8 下限。小 MLP 的输出经 tanh，尺度为 1/127。两法共用对称 INT8、最近偶数舍入、饱和到 ±127、二补码逐坐标线序，拒绝 0x80。全收时拒绝词为空，缺失消息解为 128 维零。分组法保留原有分类 argmax 与八组 256×16 码本。",
++        "- 训练 STE 的前向严格采用硬量化，直通梯度用于舍入、VQ softmax。七个验证请求上，每法各自 FP32、BF16 的训练前向均逐位等于编码解码。跨精度结果见下表。尺度持久化为 FP32，模型参数精度随 checkpoint 绑定。",
++        "- 每法 3 个请求 × 3 臂 × 2 条推理路径，共 54 次真实本机 TCP。每端独立加载参数，握手核对 contract。最终输出逐 token 等于独立自回归 Target；同法同权重的完整前缀与 KV 路径，候选、每轮接受、载荷字节和输出逐项一致；RAW 与 SHADOW 候选和接受一致。",
++        "- 三法分别强制覆盖 0/1/7/8/3 个接受位置、全收 bonus、EOS、截断和跨请求重置。每法额外 9 个终止用例。原 12 项安全回归、32 组全收截断和原 FP32/BF16 对账通过。旧码本 9 个协议输入在原实现与新实现的字节及 control 相同，旧版 9 条 TCP 轨迹复现。",
++        "- 编码、解码、control 构建、repair 均有方法钩子；Draft decoder 的 forward pre-hook 核实实际调用及输入 token 数。KV 下每个有反馈的非终止轮各编码、解码和构建 control 一次。终止轮与 RAW 均无多余构建。",
++        "- 正常同法三臂可汇总。篡改方法、状态、64 位预算、实现、contract 或输出均已实际测试拒绝。", "",
++        "| 方法 | 跨精度字节完全相同的请求 | 56 个坐标中字节相同 | 跨精度 control 最大差 | 验证集饱和超界率 |",
++        "|---|---:|---:|---:|---:|"]
++    for m in METHODS:
++        v = precision[m]
++        saturation = training[m]["heldout_clipped_fraction"]
++        rows.append(f"| {m} | {sum(x['identical_coordinates']==8 for x in v)}/7 | {sum(x['identical_coordinates'] for x in v)} | {max(x['max_cross_dtype_control_difference'] for x in v):.6g} | {saturation if saturation is not None else '不适用'} |")
++    rows += ["", "| 方法 | 训练步数 | 首步 / 末步 token CE | 最大参数梯度范数 | 24 步耗时 ms | 离线拟合 ms |", "|---|---:|---:|---:|---:|---:|"]
++    for m in METHODS:
++        r = training[m]
++        fit = f"{r['fit_ms']:.1f}" if r["fit_ms"] is not None else "不适用"
++        rows.append(f"| {m} | {r['training_steps']} | {r['losses'][0]:.4f} / {r['losses'][-1]:.4f} | {max(r['max_gradient_norm'].values()):.6f} | {r['optimizer_smoke_ms']:.1f} | {fit} |")
++    rows += ["", "首末步使用不同请求。这里检验梯度和权重更新，训练收益需要另做匹配试验。"]
++    rows += ["", "## CPU 时延", "",
++        "Intel Core Ultra 9 185H，CPU FP32，PyTorch 单线程。每法每个形状预热 50 次，随后轮换方法顺序测 3×500 次。下表为微秒，生产形状只测随机输入的 codec；tiny 的 control 已包含解码。完整 codec 从合法协议输入开始计到 128 维输出，阶段耗时存在嵌套。",
++        "", "| H/D | 方法 | 编码 p50 | 量化打包 p50 | 解码 p50 | 完整 p50 / p95 / 均值 | 接收端共享字节 |", "|---|---|---:|---:|---:|---:|---:|"]
++    for s in bench["shapes"].values():
++        for m in METHODS:
++            t = s["timings"][m]
++            c = t["complete_codec"]
++            rows.append(f"| {s['target_hidden']}/{s['draft_hidden']} | {m} | {t['encoder']['p50_us']:.1f} | {t['quantize_pack']['p50_us']:.1f} | {t['decoder']['p50_us']:.1f} | {c['p50_us']:.1f} / {c['p95_us']:.1f} / {c['mean_us']:.1f} | {s['codecs'][m]['receiver_bytes']:,} |")
++    rows += ["", "| 方法 | tiny control p50 µs | tiny repair p50 µs | 本机 TCP RAW / SHADOW / ACTIVE 请求 p50 ms | ACTIVE 反馈 / 完整下行帧字节（九请求合计） |",
++             "|---|---:|---:|---:|---:|"]
++    for m in METHODS:
++        t = bench["shapes"]["tiny"]["timings"][m]
++        tcp = bench["localhost_tcp"][m]
++        vals = " / ".join(f"{tcp[arm]['p50_us']/1e3:.1f}" for arm in ("raw","shadow","active"))
++        rows.append(f"| {m} | {t['control_including_decode']['p50_us']:.1f} | {t['repair_projection']['p50_us']:.1f} | {vals} | {tcp['active']['feedback_bytes']} / {tcp['active']['framed_down_bytes']} |")
++    rows += ["", "TCP 另做 3 轮交错方法顺序，各连接先预热三臂，再测三个请求；每法每臂共 9 次正式请求。帧字节为生成期间应用层帧，含协议元数据，排除 IP/TCP 包头。微基准 cold、模型配置来源和摘要、分项 p50/p95/均值、参数量与离线拟合耗时见 release-bench/summary.json。GPU 事件为 null。原始样本包含在同目录。", "",
++             "## 复现及证据", "", "```powershell", ".\\run_tests.ps1 -Out .\\repro-tests",
++             ".\\run_bench.ps1 -TestRoot (Resolve-Path .\\repro-tests) -Out .\\repro-bench", "```", "",
++             "上述命令在解压目录运行。环境为随包脚本指定的 CPU Python；可通过 -Python 与 -Deps 替换。两份已核对 SHA256 的模型配置随包在 tests/model_configs。替换配置可通过 tests/bench_codecs.py 的 --target-config / --draft-config 指定。无需下载预训练权重。",
++             "", "- demo/message_codecs.py 第 79 行拟合 PCA，第 129 行起绑定和复核完整状态。第 61 行实现 INT8 的训练直通。demo/h_vq64_head.py 接入训练；demo/latency_smoke.py 接入推理及汇总。测试用 checkpoint 保存 codec 全部参数、buffer、schema、状态哈希和共同的非零 repair U。",
++             "- release-tests/training.json 逐步记录损失、最大梯度范数、训练/验证请求与拟合耗时；precision.json 记录每个验证样本的两种精度。各 TCP 子目录保留 edge/cloud 行，包括反馈十六进制、分帧字节、实际调用及 decoder 输入长度。",
++             "- demo/variant_config.json 固定既有生产 VQ checkpoint 与源文件。另两法的已测合同来自各自的 tiny checkpoint；生产上需先获得匹配权重。历史包自带的 evidence/ 属于 e99bc471 基线。",
++             "- 本地实现与基线的代码差异见 methods.patch。所有方法固定 8 字节，完整参数状态通过 schema 和 state 双摘要绑定。修订 contract 为 " + config["variant_contract_id"] + "。", "",
++             "## 结论边界", "", "最值得质疑的假设是同一模型改变精度后仍会发送相同字节。上表给出真实反例，PCA 和小 MLP 均出现变化。在约定的同一精度和同一状态下，训练前向与实际 wire 解码逐位一致。",
++             "", "本轮范围内未见阻断正确性的问题。当前证据限于小模型和一台 CPU；尚无相同生产训练预算下的接受率、完整 8B GPU 读回、端到端双机速度或真实请求负载。无法据此选择线上接受率最优的方法。"]
++    (ROOT/"METHODS_REPORT.md").write_text("\n".join(rows)+"\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    original_diff(Path(sys.argv[1]))
++    report()
++    destination = ROOT.parent / "codec-methods-local-20261120.zip"
++    selected = ["demo","tests","release-tests","release-bench","evidence/tcp-kv","methods.patch",
++                "METHODS_REPORT.md","program.md","run_tests.ps1","run_bench.ps1","run_cpu.ps1"]
++    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as z:
++        for name in selected:
++            path = ROOT / name
++            for p in sorted(path.rglob("*")) if path.is_dir() else [path]:
++                if p.is_file() and "__pycache__" not in p.parts:
++                    z.write(p, p.relative_to(ROOT))
++    with zipfile.ZipFile(destination) as z:
++        assert z.testzip() is None
++    print(destination, destination.stat().st_size, digest(destination))
+--- a/tests/review_regression.py
++++ b/tests/review_regression.py
+@@ -90,6 +90,7 @@
+                     ids[0] = 2
+                 trial = "repeat0-requestA-" + arm
+                 row = dict(trial_id=trial, request_id="A", arm=arm, warmup=False, output_ids=ids,
++                           codec_binding=dict(codec_type="grouped_vq8", bits=64, schema_sha256="1"*64, state_sha256="2"*64),
+                            contract_id="b" if mixed_contracts and arm == "active" else "a",
+                            rounds=[dict(candidate_ids=[1], committed_ids=ids, accepted=1, feedback_bytes=0)],
+                            timing=dict(calls={"target_verify": length}, host_wall_seconds={}, gpu_event_seconds={}),
+--- /dev/null
++++ b/tests/train_codecs.py
+@@ -0,0 +1,184 @@
++"""Train only the codec on causal tiny Qwen3 next-token labels and exercise the wire contract."""
++import argparse
++import copy
++import importlib.util
++import json
++from pathlib import Path
++import sys
++import time
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path[:0] = [str(ROOT / "demo"), str(ROOT / "demo/vendor")]
++import torch
++from torch.nn import functional as F
++from transformers import Qwen3Config, Qwen3ForCausalLM
++from feedback_codec.codec import CodecConfig
++from feedback_codec.fixed_probe import ProtocolView
++from feedback_codec.hf_backend import HFDraftBackend, HFTargetBackend, _FrozenHFBackend
++from h_vq64_head import HTaskHead, MessageState
++from message_codecs import METHODS, binding, make_codec, restore_codec
++
++
++class Draft(_FrozenHFBackend):
++    teacher_hidden = HFDraftBackend.teacher_hidden
++
++
++def setup(method):
++    torch.manual_seed(121)
++    cfg = Qwen3Config(vocab_size=41, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
++                      num_attention_heads=4, num_key_value_heads=2, head_dim=8, max_position_embeddings=128,
++                      attention_dropout=0., pad_token_id=0, bos_token_id=1, eos_token_id=40)
++    cfg._attn_implementation = "eager"
++    target = HFTargetBackend(Qwen3ForCausalLM(cfg), object(), device="cpu")
++    draft = Draft(Qwen3ForCausalLM(cfg), object(), device="cpu")
++    head = HTaskHead(CodecConfig(32, 32, 41), draft.model.get_output_embeddings(),
++                     draft_embedding=draft.model.get_input_embeddings(), codec_type=method)
++    with torch.no_grad():
++        head.base.core.repair.U.weight.normal_(0, .08, generator=torch.Generator().manual_seed(712))
++    head.requires_grad_(False)
++    head.message.requires_grad_(True)
++    head.train()
++    head.base.eval()
++    return target, draft, head
++
++
++def dataset(target, draft, head, split, prompts):
++    rows = []
++    table = draft.model.get_input_embeddings().weight
++    with torch.no_grad():
++        for index in prompts:
++            prompt = [1, 8 + index // 24, 10 + index % 24]
++            step = target.next(prompt)
++            if step.token_id == 40:
++                continue
++            rejected = int(draft.next(prompt).token_id) if hasattr(draft, "next") else int(
++                draft._forward_with_final_hidden(draft._ids(prompt))[0].logits[0, -1].argmax())
++            if rejected == step.token_id:
++                continue
++            confirmed = prompt + [step.token_id]
++            protocol = ProtocolView(tuple(confirmed), 8, 0, rejected, step.token_id)
++            base = head.base.prepare_view(protocol, draft)
++            inputs = (step.hidden.reshape(1, -1).clone(), 0, table[rejected].reshape(1, -1).clone(),
++                      table[step.token_id].reshape(1, -1).clone())
++            label = target.next(confirmed).token_id
++            rows.append((split, str(prompt), inputs, MessageState(base, inputs, None, tuple(confirmed)),
++                         draft.teacher_hidden(confirmed, [0]).clone(), torch.tensor([label])))
++    return rows
++
++
++def rejects(fn):
++    try:
++        fn()
++    except (ValueError, TypeError, FloatingPointError, RuntimeError):
++        return
++    raise AssertionError("invalid input accepted")
++
++
++def wire_checks(codec, inputs):
++    results = {}
++    for dtype in [torch.float32, torch.bfloat16]:
++        m = copy.deepcopy(codec).to(dtype)
++        x = tuple(v.to(dtype) if torch.is_tensor(v) else v for v in inputs)
++        b = m.encode_payload(*x)
++        control = m.decode_payload(b)
++        error = (control - m.train_control(*x)).abs().max().item()
++        assert error == 0 and len(b) == 8 and type(b) is bytes and b == m.encode_payload(*x)
++        identity = binding(m)
++        other = restore_codec(identity, copy.deepcopy(m.state_dict()))
++        assert other.encode_payload(*x) == b and torch.equal(other.decode_payload(b), control)
++        assert torch.equal(m.decode_payload(None), torch.zeros_like(control))
++        for bad in [b"0", bytes(9), bytearray(b), 0]:
++            rejects(lambda: m.decode_payload(bad))
++        for val in [float("inf"), float("nan")]:
++            rejects(lambda: m.encode_payload(torch.full_like(x[0], val), *x[1:]))
++        for accepted, rejected in [(True, x[2]), (9, None), (0, None), (8, x[2])]:
++            rejects(lambda: m.encode_payload(x[0], accepted, rejected, x[3]))
++        assert len(m.encode_payload(x[0], 8, None, x[3])) == 8
++        bad_state = copy.deepcopy(m.state_dict())
++        key = "codebook" if m.codec_type == "grouped_vq8" else "scale"
++        bad_state[key].reshape(-1)[0] += 1
++        rejects(lambda: restore_codec(identity, bad_state))
++        rejects(lambda: restore_codec(dict(identity, version=2), m.state_dict()))
++        if m.codec_type == "grouped_vq8":
++            ids = torch.tensor([0, 1, 127, 128, 200, 250, 254, 255])
++            assert m._wire(ids) == bytes(ids.tolist())
++            assert torch.equal(m.decode_payload(bytes(ids.tolist())), m.codebook[torch.arange(8), ids].reshape(1, 128))
++        else:
++            units = torch.tensor([[-200., -127., -2.5, -.5, .5, 1.5, 127., 200.]])
++            assert m.pack(units * m.scale.float()) == bytes([129, 129, 254, 0, 0, 2, 127, 127])
++            rejects(lambda: m.decode_payload(bytes([128]) * 8))
++        results[str(dtype)] = {"wire_hex": b.hex(), "wire_vs_train_control_max_abs": error,
++                               "checkpoint_bytes_identical": True}
++    results["fp32_bf16_bytes_equal"] = results["torch.float32"]["wire_hex"] == results["torch.bfloat16"]["wire_hex"]
++    return results
++
++
++def loss(head, row):
++    return F.cross_entropy(head.forward_logits(row[4], row[3], 1), row[5])
++
++
++def run(method, out):
++    target, draft, head = setup(method)
++    train = dataset(target, draft, head, "train", range(32))
++    valid = dataset(target, draft, head, "validation", range(40, 48))
++    assert not {r[1] for r in train} & {r[1] for r in valid}
++    m = head.message
++    fit_ms = None
++    if method == "pca_int8":
++        rejects(lambda: m.encode_payload(*valid[0][2]))
++        rejects(lambda: m.fit(r[:3] for r in valid))
++        rejects(lambda: m.fit([train[0][:3]] * 12))
++        rejects(lambda: m.fit([train[0][:3]] * 7))
++        start = time.perf_counter()
++        m.fit(r[:3] for r in train)
++        fit_ms = 1000 * (time.perf_counter() - start)
++        rejects(lambda: m.fit(r[:3] for r in train))
++    frozen = {n: p.detach().clone() for n, p in head.named_parameters() if not p.requires_grad}
++    buf = copy.deepcopy(m.state_dict())
++    optimizer = torch.optim.AdamW(m.parameters(), lr=.002, weight_decay=0.)
++    losses, gradients = [], {}
++    start = time.perf_counter()
++    for step in range(24):
++        optimizer.zero_grad(set_to_none=True)
++        value = loss(head, train[step % len(train)])
++        value.backward()
++        losses.append(float(value.detach()))
++        for n, p in m.named_parameters():
++            assert p.grad is not None and p.grad.isfinite().all()
++            gradients[n] = max(gradients.get(n, 0.), float(p.grad.norm()))
++        optimizer.step()
++    train_ms = 1000 * (time.perf_counter() - start)
++    assert all(v > 0 for v in gradients.values())
++    for n, p in head.named_parameters():
++        if n in frozen:
++            assert p.grad is None and torch.equal(frozen[n], p)
++    for n, p in m.named_parameters():
++        assert p.isfinite().all() and not torch.equal(p, buf[n])
++    assert all(torch.equal(v, buf[n]) for n, v in m.named_buffers())
++    checks = wire_checks(m, valid[0][2])
++    with torch.no_grad():
++        heldout_ce = sum(float(loss(head, r)) for r in valid) / len(valid)
++        clipped = [int((m.normalized(m.coordinates(*r[2])).abs() > 127).sum())
++                   for r in valid] if method != "grouped_vq8" else []
++    identity = binding(m)
++    path = out / (method + ".pt")
++    torch.save({"binding": identity, "message": m.state_dict(), "repair_U": head.base.core.repair.U.weight}, path)
++    data = torch.load(path, weights_only=True)
++    restored = restore_codec(identity, data["message"])
++    assert restored.encode_payload(*valid[0][2]) == m.encode_payload(*valid[0][2])
++    return {"binding": identity, "frozen_parameters": len(frozen), "train_requests": [r[1] for r in train],
++            "heldout_requests": [r[1] for r in valid], "training_steps": 24, "losses": losses,
++            "heldout_ce_smoke_only": heldout_ce, "max_gradient_norm": gradients, "wire": checks,
++            "heldout_clipped_fraction": sum(clipped)/(8*len(clipped)) if clipped else None,
++            "fit_ms": fit_ms, "optimizer_smoke_ms": train_ms}
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("out", type=Path)
++    args = parser.parse_args()
++    args.out.mkdir(parents=True, exist_ok=True)
++    torch.set_num_threads(1)
++    results = {m: run(m, args.out) for m in METHODS}
++    (args.out / "training.json").write_text(json.dumps(results, indent=2))
++    print("passed", list(results))

@@ -1,0 +1,10 @@
+[
+  {
+    "Path": "C:\\Users\\asus\\Documents\\Codex\\2026-11-10\\w-x\\outputs\\A100-marker-handoff-20261114\\source_snapshot\\model_configs\\Qwen3-8B\\config.json",
+    "Hash": "F7C4EADFBBF522470667B797A3C89BE2524832D2D599797248DC304FFF447C30"
+  },
+  {
+    "Path": "C:\\Users\\asus\\Documents\\Codex\\2026-09-29\\n\\experiments\\specbranch-reproduction\\artifacts\\qwen3-0.6b-transfer\\config.json",
+    "Hash": "660DB3B73D788119C04535E48CF9BE5F55BC3100841A718637AE695B442F27DD"
+  }
+]
