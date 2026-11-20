@@ -1,6 +1,8 @@
 """Evaluate the fixed first 200 development requests using a dc6-selected codec."""
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import sys
 import time
@@ -108,8 +110,15 @@ def check_trace(result, row, arm, contract):
     require(offset == len(oracle), "incomplete request")
 
 
-def recover_rows(out, rows, contract, original_contract, source=None):
-    """Keep old evidence immutable. Only import verified rows from a completed 503 run."""
+def verify_pair(trials):
+    def trajectory(arm):
+        return [(r["candidate_ids"], r["accepted"], r["committed_ids"]) for r in trials[arm]["rounds"]]
+
+    require(trajectory("raw") == trajectory("shadow"), "RAW/SHADOW trajectories differ")
+
+
+def recover_rows(out, rows, contract, original_contract, source=None, *, sealed_only=False):
+    """Validate a request's three archived measurements together before copying any arm."""
     path = out / "contract.json"
     if path.exists():
         require(read(path) == contract, "eval200 contract/cohort changed")
@@ -121,32 +130,53 @@ def recover_rows(out, rows, contract, original_contract, source=None):
         require(
             read(source / "contract.json") == original_contract, "503 source method/checkpoint/roster differs"
         )
-        completion = read(source / "completion.json")
-        require(
-            completion["requests"] == 503 and completion["contract"] == digest(original_contract),
-            "503 source completion differs",
-        )
+        if not sealed_only:
+            completion = read(source / "completion.json")
+            require(
+                completion["requests"] == 503 and completion["contract"] == digest(original_contract),
+                "503 source completion differs",
+            )
     for arm in ARMS:
         folder = out / arm
         folder.mkdir(exist_ok=True)
         require(all(p.stem in ids for p in folder.glob("*.json")), "extra request from a different cohort")
-        for row in rows:
-            name = row["request_id"] + ".json"
-            dest = folder / name
+
+    imported = []
+    for row in rows:
+        name = row["request_id"] + ".json"
+        present = {}
+        for arm in ARMS:
+            dest = out / arm / name
             if dest.exists():
-                check_trace(read(dest), row, arm, contract)
-            elif source is not None:
-                raw = source / arm / name
-                original = read(raw)
-                check_trace(original, row, arm, original_contract)
-                adapted = {
-                    **original,
-                    "contract_id": digest(contract),
-                    "source_row_sha256": sha(raw),
-                    "source_contract_id": original["contract_id"],
-                    "measurement_origin": "archived_eval503",
-                }
-                write(dest, adapted)
+                present[arm] = read(dest)
+                check_trace(present[arm], row, arm, contract)
+        if len(present) == len(ARMS):
+            verify_pair(present)
+            continue
+        if source is None:
+            continue
+        paths = {arm: source / arm / name for arm in ARMS}
+        if sealed_only and not all(path.is_file() for path in paths.values()):
+            continue
+        archive = {}
+        for arm, path in paths.items():
+            raw = path.read_bytes()
+            trial = json.loads(raw)
+            check_trace(trial, row, arm, original_contract)
+            archive[arm] = {
+                **trial,
+                "contract_id": digest(contract),
+                "source_row_sha256": hashlib.sha256(raw).hexdigest(),
+                "source_contract_id": trial["contract_id"],
+                "measurement_origin": "archived_eval503",
+            }
+        verify_pair(archive)
+        verify_pair({**archive, **present})
+        for arm in ARMS:
+            if arm not in present:
+                write(out / arm / name, archive[arm])
+        imported.append(row["request_id"])
+    return imported
 
 
 def main():
@@ -163,10 +193,16 @@ def main():
         "--manifest", type=Path, default=Path("/data/task59-a100-closedloop-20261114-v1/models.json")
     )
     p.add_argument("--models", type=Path, default=Path("/data/transfer_from_4090/models"))
-    p.add_argument(
+    reuse = p.add_mutually_exclusive_group()
+    reuse.add_argument(
         "--reuse-complete-503",
         action="store_true",
         help="use verified rows of the matching completed eval503",
+    )
+    reuse.add_argument(
+        "--reuse-sealed-503",
+        action="store_true",
+        help="import fully verified three-arm requests even while eval503 is incomplete",
     )
     args = p.parse_args()
     rows = cohort(args.roster)
@@ -236,7 +272,10 @@ def main():
         }
         out = folder / "eval200"
         out.mkdir(parents=True, exist_ok=True)
-        recover_rows(out, rows, contract, original, folder / "eval503" if args.reuse_complete_503 else None)
+        source = folder / "eval503" if args.reuse_complete_503 or args.reuse_sealed_503 else None
+        imported = recover_rows(out, rows, contract, original, source, sealed_only=args.reuse_sealed_503)
+        if source is not None:
+            print(f"Imported archived measurements for {len(imported)} requests this invocation.", flush=True)
         head.requires_grad_(False).eval()
         target = HFTargetBackend(
             str(args.models / "Qwen3-8B"), None, device=str(device), dtype=torch.bfloat16
